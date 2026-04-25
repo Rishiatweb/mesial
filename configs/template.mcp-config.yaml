@@ -1,0 +1,7 @@
+redis:
+  enabled: true
+  host: redis-stack
+  port: "6379"
+  username: ""
+  password: ""
+  ssl: false

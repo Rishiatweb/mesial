@@ -1,0 +1,45 @@
+services:
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: redis-h9s
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - h9s-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mcp-gateway:
+    image: docker/mcp-gateway
+    restart: unless-stopped
+    command:
+      - --enable-all-servers
+      - --config=/mcp/config.yaml
+      - --catalog=/mcp/custom-catalog.yaml
+      - --transport=streaming
+      - --port=8812
+      - --verbose
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./configs/mcp-config.yaml:/mcp/config.yaml:ro
+      - ./configs/custom-catalog.yaml:/mcp/custom-catalog.yaml:ro
+    ports:
+      - "8812:8812"
+    networks:
+      - h9s-network
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+
+networks:
+  h9s-network:
+    driver: bridge
+
+volumes:
+  redis_data:

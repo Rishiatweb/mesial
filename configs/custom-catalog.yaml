@@ -1,0 +1,61 @@
+name: h9s-catalog
+displayName: h9s Memory Catalog
+registry:
+  redis:
+    description: Redis database operations - key/value, hashes, lists, sets, sorted sets, streams, pub/sub, and vector search
+    title: Redis
+    type: server
+    image: mcp/redis@sha256:c9162917b62dda5495feb9a2ca277564269cf2bfbe6d468b851a9dcb6c88d686
+    tools:
+      - name: get
+      - name: set
+      - name: delete
+      - name: expire
+      - name: scan_keys
+      - name: hget
+      - name: hgetall
+      - name: hset
+      - name: hdel
+      - name: lpush
+      - name: rpush
+      - name: lpop
+      - name: rpop
+      - name: lrange
+      - name: llen
+      - name: sadd
+      - name: smembers
+      - name: srem
+      - name: zadd
+      - name: zrange
+      - name: zrem
+      - name: xadd
+      - name: xrange
+      - name: xdel
+      - name: publish
+      - name: subscribe
+      - name: unsubscribe
+      - name: json_get
+      - name: json_set
+      - name: json_del
+      - name: info
+      - name: dbsize
+      - name: type
+      - name: rename
+      - name: scan_all_keys
+      - name: search_redis_documents
+      - name: client_list
+    secrets:
+      - name: redis.password
+        env: REDIS_PWD
+        example: ""
+    env:
+      - name: REDIS_HOST
+        value: "{{redis.host}}"
+      - name: REDIS_PORT
+        value: "{{redis.port}}"
+      - name: REDIS_USERNAME
+        value: "{{redis.username}}"
+      - name: REDIS_PWD
+        value: "{{redis.password}}"
+      - name: REDIS_SSL
+        value: "{{redis.ssl}}"
