@@ -132,3 +132,17 @@ registry:
               type: string
         required:
           - paths
+
+  h9s-ingest:
+    description: Document ingestion and semantic search — chunk markdown, embed, store and query vectors in Redis
+    title: h9s Ingest
+    type: server
+    image: h9s-ingest:latest
+    tools:
+      - name: ingest_documents
+      - name: search_documents
+    env:
+      - name: REDIS_ADDR
+        value: "redis-stack:6379"
+      - name: EMBEDDING_URL
+        value: "http://host.docker.internal:8090"

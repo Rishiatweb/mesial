@@ -3,3 +3,5 @@ configs/mcp-config.yaml
 .direnv/
 .docker/
 models/
+/chunker
+/ingest

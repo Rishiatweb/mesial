@@ -7,28 +7,30 @@
 - [x] Nix devshell with Go + docker-mcp
 - [x] Go markdown chunker CLI (`cmd/chunker/`)
 - [x] Global Claude Code MCP registration (`--scope user`)
+- [x] Embedding model: `Qwen3-Embedding-0.6B-Q8_0.gguf` (1024-dim, Matryoshka) in `models/`
+- [x] FalkorDB vector store: Chunk nodes with 512-dim cosine vector index
+- [x] Go MCP server (`cmd/ingest/`): `ingest_documents` + `search_documents` tools
+- [x] Chunking library extracted to `internal/chunking/`
+- [x] Embedding client (`internal/embedding/`) for llama-server `/v1/embeddings`
+- [x] FalkorDB store (`internal/falkorstore/`) with vector index + KNN search
+- [x] Dockerfile.ingest + compose service + MCP catalog registration
 
 ## Next
 
-### Embedding model
-- Download `Qwen/Qwen3-Embedding-0.6B-GGUF` (Q6_K) into `models/`
-- Run via `llama-server --embedding -m models/... --port 8090`
-- Output dim: 1024 (Matryoshka — can truncate to 512/256 if needed)
-- Pooling: last-token (matches Qwen3-Embedding)
-
-### Redis data structure
-- Design key schema for document chunks (e.g., `doc:{source}:{line_start}`)
-- Create HNSW vector index: `create_vector_index_hash` with dim=1024, COSINE
-- Fields per hash: breadcrumb, content, source, line_start, line_end, vector
-
-### Go MCP server (ingestion)
-- Restructure `cmd/chunker/` into an MCP server exposing `ingest_documents` tool
-- Chunks markdown by heading boundaries (reuse existing chunker logic)
-- Calls `llama-server /v1/embeddings` for each chunk
-- Writes hashes + vectors directly to Redis via `go-redis`
-- Package as container image for the compose stack
-- Future: push to registry for cross-project use
+### Embedding model runtime
+- Run via `llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090`
+- Consider adding llama-server to compose stack or Nix devshell
 
 ### Retrieval integration
-- Claude Code queries: embed query via llama-server, then `vector_search_hash`
+- Claude Code queries: embed query via `search_documents` tool
 - Consider a CLAUDE.md instruction or hook for automatic context retrieval
+
+### Future
+- Push ingest image to registry for cross-project use
+- Add non-markdown format support (via markitdown conversion)
+- Explore graph relationships between chunks (cross-document linking)
+
+## Notes
+
+- RediSearch vector indexing crashes on arm64/Apple Silicon (tested Redis Stack 7.4, Redis 8.6). Pivoted to FalkorDB which works correctly on arm64.
+- Using 512-dim Matryoshka truncation (from native 1024) — adequate for document retrieval.
