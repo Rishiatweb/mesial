@@ -5,3 +5,15 @@ redis:
   username: ""
   password: ""
   ssl: false
+
+context7:
+  enabled: true
+
+github:
+  enabled: true
+  personal_access_token: <GITHUB_PERSONAL_ACCESS_TOKEN>
+
+markitdown:
+  enabled: true
+  paths:
+    - /workspace

@@ -1,5 +1,5 @@
 name: h9s-catalog
-displayName: h9s Memory Catalog
+displayName: h9s General-Purpose Catalog
 registry:
   redis:
     description: Redis database operations - key/value, hashes, lists, sets, sorted sets, streams, pub/sub, and vector search
@@ -59,3 +59,76 @@ registry:
         value: "{{redis.password}}"
       - name: REDIS_SSL
         value: "{{redis.ssl}}"
+
+  context7:
+    description: Up-to-date code documentation for LLMs and AI code editors
+    title: Context7
+    type: server
+    image: mcp/context7@sha256:1174e6a29634a83b2be93ac1fefabf63265f498c02c72201fe3464e687dd8836
+    tools:
+      - name: resolve-library-id
+      - name: get-library-docs
+    env:
+      - name: MCP_TRANSPORT
+        value: stdio
+
+  github:
+    description: GitHub API interaction - issues, pull requests, repositories, and code search
+    title: GitHub
+    type: server
+    image: mcp/github@sha256:89fd71b6f2dd098de0d7517c1899b7fe90590d3193e253991d61a800b041bfd4
+    tools:
+      - name: search_repositories
+      - name: search_code
+      - name: search_issues
+      - name: search_users
+      - name: list_issues
+      - name: get_issue
+      - name: create_issue
+      - name: update_issue
+      - name: add_issue_comment
+      - name: list_pull_requests
+      - name: get_pull_request
+      - name: get_pull_request_comments
+      - name: get_pull_request_files
+      - name: get_pull_request_reviews
+      - name: get_pull_request_status
+      - name: create_pull_request
+      - name: create_pull_request_review
+      - name: merge_pull_request
+      - name: update_pull_request_branch
+      - name: create_branch
+      - name: get_file_contents
+      - name: create_or_update_file
+      - name: push_files
+      - name: list_commits
+      - name: create_repository
+      - name: fork_repository
+    secrets:
+      - name: github.personal_access_token
+        env: GITHUB_PERSONAL_ACCESS_TOKEN
+        example: <YOUR_TOKEN>
+    env:
+      - name: GITHUB_PERSONAL_ACCESS_TOKEN
+        value: "{{github.personal_access_token}}"
+
+  markitdown:
+    description: Convert PDF, DOCX, PPTX, XLSX, HTML, audio, and YouTube to markdown
+    title: Markitdown
+    type: server
+    image: mcp/markitdown@sha256:a93f01634ef919fae708b3c173f88785e6c586d9e485fef0a2bb15363f29cc1d
+    tools:
+      - name: convert_to_markdown
+    volumes:
+      - '{{markitdown.paths|volume|into}}'
+    config:
+      - name: markitdown
+        description: The MCP server is allowed to access these paths
+        type: object
+        properties:
+          paths:
+            type: array
+            items:
+              type: string
+        required:
+          - paths

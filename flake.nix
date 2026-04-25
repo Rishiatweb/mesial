@@ -51,6 +51,11 @@
           export DOCKER_CONFIG="$PWD/.docker"
           mkdir -p "$DOCKER_CONFIG/cli-plugins"
 
+          # Carry over Docker contexts (Colima, etc.) from the user config
+          if [ -d "$HOME/.docker/contexts" ] && [ ! -d "$DOCKER_CONFIG/contexts" ]; then
+            ln -sf "$HOME/.docker/contexts" "$DOCKER_CONFIG/contexts"
+          fi
+
           ln -sf "${docker-mcp}/bin/docker-mcp" \
             "$DOCKER_CONFIG/cli-plugins/docker-mcp"
 
