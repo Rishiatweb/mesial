@@ -17,3 +17,9 @@ markitdown:
   enabled: true
   paths:
     - /workspace
+
+falkordb:
+  enabled: true
+
+h9s-ingest:
+  enabled: true

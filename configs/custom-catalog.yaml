@@ -133,8 +133,24 @@ registry:
         required:
           - paths
 
+  falkordb:
+    description: FalkorDB graph database — execute OpenCypher queries, manage nodes and relationships, vector search
+    title: FalkorDB
+    type: server
+    image: falkordb/mcpserver:latest
+    tools:
+      - name: query_graph
+      - name: query_graph_readonly
+    env:
+      - name: FALKORDB_HOST
+        value: "falkordb-h9s"
+      - name: FALKORDB_PORT
+        value: "6379"
+      - name: MCP_TRANSPORT
+        value: stdio
+
   h9s-ingest:
-    description: Document ingestion and semantic search — chunk markdown, embed, store and query vectors in Redis
+    description: Document ingestion and semantic search — chunk markdown, embed, store and query vectors in FalkorDB
     title: h9s Ingest
     type: server
     image: h9s-ingest:latest
@@ -142,7 +158,7 @@ registry:
       - name: ingest_documents
       - name: search_documents
     env:
-      - name: REDIS_ADDR
-        value: "redis-stack:6379"
+      - name: FALKOR_ADDR
+        value: "falkordb-h9s:6379"
       - name: EMBEDDING_URL
         value: "http://host.docker.internal:8090"
