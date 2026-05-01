@@ -15,22 +15,6 @@ services:
       timeout: 5s
       retries: 10
 
-  redis-stack:
-    image: redis/redis-stack:latest
-    container_name: redis-h9s
-    restart: unless-stopped
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - h9s-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   ingest:
     build:
       context: .
@@ -69,7 +53,7 @@ services:
     networks:
       - h9s-network
     depends_on:
-      redis-stack:
+      falkordb:
         condition: service_healthy
 
 networks:
@@ -78,4 +62,3 @@ networks:
 
 volumes:
   falkor_data:
-  redis_data:
