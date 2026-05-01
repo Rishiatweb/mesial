@@ -1,6 +1,6 @@
 .PHONY: up down embed ingest build
 
-# Start all services (FalkorDB, Redis Stack, MCP Gateway)
+# Start all services (FalkorDB, ingest, MCP Gateway)
 up:
 	docker compose up -d
 
