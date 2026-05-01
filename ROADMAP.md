@@ -15,6 +15,14 @@
 - [x] FalkorDB store (`internal/falkorstore/`) with vector index + KNN search
 - [x] Dockerfile.ingest + compose service + MCP catalog registration
 
+- [x] TypeScript code graph analyzer (`internal/analyzer/`) — tree-sitter pass 1 + LSP pass 2
+- [x] Language-agnostic `Analyzer` interface for future Python/Go support
+- [x] FalkorDB code graph methods (`internal/falkorstore/codegraph.go`)
+- [x] LSP client (`internal/lspclient/`) for typescript-language-server
+- [x] MCP tool `analyze_repository` — per-repo graph isolation
+- [x] Graph schema: File, Class, Function, Method, Constructor, Interface, Enum + Searchable meta-label
+- [x] Relationships: DEFINES, CALLS, EXTENDS, IMPLEMENTS, RETURNS, PARAMETERS
+
 ## Next
 
 ### Embedding model runtime
@@ -28,7 +36,9 @@
 ### Future
 - Push ingest image to registry for cross-project use
 - Add non-markdown format support (via markitdown conversion)
-- Explore graph relationships between chunks (cross-document linking)
+- DOCUMENTS edges linking doc chunks to code entities
+- Python and Go analyzers
+- Incremental re-indexing (detect changed files via git)
 
 ## Notes
 

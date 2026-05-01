@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/mknw/h9s/internal/analyzer"
 	"github.com/mknw/h9s/internal/chunking"
 	"github.com/mknw/h9s/internal/embedding"
 	"github.com/mknw/h9s/internal/falkorstore"
@@ -175,6 +177,56 @@ func main() {
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: sb.String()}},
+		}, nil, nil
+	})
+
+	// --- analyze_repository tool ---
+
+	lspCmd := env("H9S_LSP_CMD", "typescript-language-server")
+
+	type AnalyzeInput struct {
+		Path   string   `json:"path"   jsonschema:"Absolute filesystem path to the repository root."`
+		Ignore []string `json:"ignore" jsonschema:"Directory names to skip (e.g. node_modules, dist, .git). Uses sensible defaults if omitted."`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "analyze_repository",
+		Description: "Analyze a TypeScript/TSX codebase: parse source with tree-sitter, resolve symbols via LSP, and store the code graph in FalkorDB. Creates one graph per repository.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AnalyzeInput) (*mcp.CallToolResult, any, error) {
+		if input.Path == "" {
+			return nil, nil, fmt.Errorf("path is required")
+		}
+
+		info, err := os.Stat(input.Path)
+		if err != nil || !info.IsDir() {
+			return nil, nil, fmt.Errorf("path %q is not a valid directory", input.Path)
+		}
+
+		repoGraphName := filepath.Base(input.Path)
+		ignore := analyzer.MergeIgnore(input.Ignore)
+
+		// Create a separate store for this repo's graph
+		repoStore, err := falkorstore.NewStore(falkorAddr, repoGraphName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", repoGraphName, err)
+		}
+		defer repoStore.Close()
+
+		tsAnalyzer := analyzer.NewTypeScriptAnalyzer()
+		defer tsAnalyzer.Close()
+
+		orch := analyzer.NewOrchestrator(tsAnalyzer, repoStore, lspCmd, []string{"--stdio"})
+		result, err := orch.Analyze(ctx, input.Path, ignore)
+		if err != nil {
+			return nil, nil, fmt.Errorf("analysis failed: %w", err)
+		}
+
+		summary := fmt.Sprintf(
+			"Analyzed %q → graph %q: %d files, %d entities, %d relationships (%d errors).",
+			input.Path, repoGraphName, result.Files, result.Entities, result.Relationships, result.Errors,
+		)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 		}, nil, nil
 	})
 

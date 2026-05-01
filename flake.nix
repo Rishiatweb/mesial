@@ -43,6 +43,8 @@
         packages = [
           pkgs.go
           pkgs.docker-client
+          pkgs.nodePackages.typescript-language-server
+          pkgs.nodePackages.typescript
 
           docker-mcp
         ];
