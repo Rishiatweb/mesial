@@ -7,9 +7,11 @@ up:
 down:
 	docker compose down
 
-# Start the embedding server (runs in foreground)
+# Start the embedding server (runs in foreground).
+# --ctx-size 8192 handles long doc chunks (default is too small and crashes
+# the server on inputs above a few hundred tokens). Qwen3 supports up to 32k.
 embed:
-	llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090
+	llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090 --ctx-size 8192
 
 # Run the ingest MCP server in HTTP mode (for dev/testing)
 ingest:

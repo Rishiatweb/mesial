@@ -51,10 +51,17 @@ func (s *Store) EnsureIndex(ctx context.Context, dim int) error {
 	return err
 }
 
-// StoreChunks creates Chunk nodes with embeddings. Returns count stored.
-func (s *Store) StoreChunks(ctx context.Context, chunks []chunking.Chunk, vectors [][]float32) (int, error) {
+// StoreChunks creates Chunk nodes with embeddings, each anchored to a File node
+// via a (:Chunk)-[:OF_FILE]->(:File) edge. fileIDs must be parallel to chunks
+// (one File node ID per chunk; callers typically MERGE the File once per source
+// path via AddFile and replicate the ID across all chunks for that source).
+// Returns count stored.
+func (s *Store) StoreChunks(ctx context.Context, chunks []chunking.Chunk, vectors [][]float32, fileIDs []int64) (int, error) {
 	if len(chunks) != len(vectors) {
 		return 0, fmt.Errorf("chunks (%d) and vectors (%d) length mismatch", len(chunks), len(vectors))
+	}
+	if len(chunks) != len(fileIDs) {
+		return 0, fmt.Errorf("chunks (%d) and fileIDs (%d) length mismatch", len(chunks), len(fileIDs))
 	}
 	if len(chunks) == 0 {
 		return 0, nil
@@ -63,6 +70,7 @@ func (s *Store) StoreChunks(ctx context.Context, chunks []chunking.Chunk, vector
 	stored := 0
 	for i, chunk := range chunks {
 		params := map[string]interface{}{
+			"file_id":    fileIDs[i],
 			"breadcrumb": chunk.Breadcrumb,
 			"content":    chunk.Content,
 			"source":     chunk.Source,
@@ -72,7 +80,9 @@ func (s *Store) StoreChunks(ctx context.Context, chunks []chunking.Chunk, vector
 		}
 
 		_, err := s.graph.Query(
-			"CREATE (:Chunk {breadcrumb: $breadcrumb, content: $content, source: $source, line_start: $line_start, line_end: $line_end, vector: vecf32($vector)})",
+			"MATCH (f:File) WHERE ID(f) = $file_id "+
+				"CREATE (c:Chunk {breadcrumb: $breadcrumb, content: $content, source: $source, line_start: $line_start, line_end: $line_end, vector: vecf32($vector)}) "+
+				"CREATE (c)-[:OF_FILE]->(f)",
 			params, nil,
 		)
 		if err != nil {
@@ -87,13 +97,85 @@ func (s *Store) StoreChunks(ctx context.Context, chunks []chunking.Chunk, vector
 func (s *Store) DeleteBySource(ctx context.Context, source string) (int, error) {
 	params := map[string]interface{}{"source": source}
 	res, err := s.graph.Query(
-		"MATCH (c:Chunk {source: $source}) DELETE c",
+		"MATCH (c:Chunk {source: $source}) DETACH DELETE c",
 		params, nil,
 	)
 	if err != nil {
 		return 0, err
 	}
 	return res.NodesDeleted(), nil
+}
+
+// StoreOversizedChunks creates :Chunk nodes for sections that exceed the size
+// threshold the caller enforces. They carry full content and OF_FILE anchoring
+// (so the linker can scan them for identifier mentions and graph traversal
+// surfaces them) but have no vector — they are invisible to KNN search. Marks
+// each node with oversized=true.
+func (s *Store) StoreOversizedChunks(ctx context.Context, chunks []chunking.Chunk, fileIDs []int64) (int, error) {
+	if len(chunks) != len(fileIDs) {
+		return 0, fmt.Errorf("chunks (%d) and fileIDs (%d) length mismatch", len(chunks), len(fileIDs))
+	}
+	if len(chunks) == 0 {
+		return 0, nil
+	}
+	stored := 0
+	for i, chunk := range chunks {
+		params := map[string]interface{}{
+			"file_id":    fileIDs[i],
+			"breadcrumb": chunk.Breadcrumb,
+			"content":    chunk.Content,
+			"source":     chunk.Source,
+			"line_start": chunk.LineStart,
+			"line_end":   chunk.LineEnd,
+		}
+		_, err := s.graph.Query(
+			"MATCH (f:File) WHERE ID(f) = $file_id "+
+				"CREATE (c:Chunk {breadcrumb: $breadcrumb, content: $content, source: $source, line_start: $line_start, line_end: $line_end, oversized: true}) "+
+				"CREATE (c)-[:OF_FILE]->(f)",
+			params, nil,
+		)
+		if err != nil {
+			return stored, fmt.Errorf("creating oversized chunk node %d: %w", i, err)
+		}
+		stored++
+	}
+	return stored, nil
+}
+
+// ChunkRow is a minimal projection of a :Chunk node for linker scanning.
+type ChunkRow struct {
+	ID      int64
+	Content string
+}
+
+// FetchChunks returns chunks for linking. If source is empty, returns all
+// chunks in the graph; otherwise filters by c.source.
+func (s *Store) FetchChunks(ctx context.Context, source string) ([]ChunkRow, error) {
+	var (
+		res    *falkordb.QueryResult
+		err    error
+		params = map[string]interface{}{}
+	)
+	if source == "" {
+		res, err = s.graph.Query("MATCH (c:Chunk) RETURN ID(c), c.content", nil, nil)
+	} else {
+		params["source"] = source
+		res, err = s.graph.Query("MATCH (c:Chunk {source: $source}) RETURN ID(c), c.content", params, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching chunks: %w", err)
+	}
+	var out []ChunkRow
+	for res.Next() {
+		r := res.Record()
+		idVal, _ := r.GetByIndex(0)
+		contentVal, _ := r.GetByIndex(1)
+		out = append(out, ChunkRow{
+			ID:      toInt64(idVal),
+			Content: fmt.Sprint(contentVal),
+		})
+	}
+	return out, nil
 }
 
 // SearchResult holds a single vector search hit.
