@@ -132,3 +132,36 @@ func (s *Store) DeleteAllNodes(ctx context.Context) error {
 	}
 	return nil
 }
+
+// CodeEntity is a name-indexed reference to a Searchable code entity, used by
+// the doc linker to build a name → IDs lookup table.
+type CodeEntity struct {
+	ID   int64
+	Name string
+}
+
+// FetchCodeEntities returns all code entity nodes (Class, Function, Method,
+// Interface, Enum, Constructor) — explicitly excluding :File, which is not a
+// valid DOCUMENTS link target per the data model.
+func (s *Store) FetchCodeEntities(ctx context.Context) ([]CodeEntity, error) {
+	res, err := s.graph.Query(
+		"MATCH (s:Searchable) "+
+			"WHERE s:Class OR s:Function OR s:Method OR s:Interface OR s:Enum OR s:Constructor "+
+			"RETURN ID(s), s.name",
+		nil, nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fetching code entities: %w", err)
+	}
+	var out []CodeEntity
+	for res.Next() {
+		r := res.Record()
+		idVal, _ := r.GetByIndex(0)
+		nameVal, _ := r.GetByIndex(1)
+		out = append(out, CodeEntity{
+			ID:   toInt64(idVal),
+			Name: fmt.Sprint(nameVal),
+		})
+	}
+	return out, nil
+}
