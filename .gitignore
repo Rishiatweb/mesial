@@ -5,3 +5,4 @@ configs/mcp-config.yaml
 models/
 /chunker
 /ingest
+/h9s-cli
