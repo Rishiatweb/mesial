@@ -1,4 +1,4 @@
-.PHONY: up down embed ingest build
+.PHONY: up down embed ingest build cli smoke
 
 # Start all services (FalkorDB, ingest, MCP Gateway)
 up:
@@ -20,3 +20,14 @@ ingest:
 # Build all Go binaries
 build:
 	go build ./...
+
+# Build the dev CLI (h9s-cli) into the repo root.
+cli:
+	go build -o h9s-cli ./cmd/h9s-cli
+
+# End-to-end smoke: run the CLI against a known repo. Requires FalkorDB
+# (`make up`) and the embedding server (`make embed`) to be running.
+# Override SMOKE_REPO to point at a different repository.
+SMOKE_REPO ?= /Users/mknw/Code/kg-agent
+smoke: cli
+	./h9s-cli analyze $(SMOKE_REPO)
