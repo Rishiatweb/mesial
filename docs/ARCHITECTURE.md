@@ -149,6 +149,58 @@ RETURN c ORDER BY c.line_start
 
 No explicit `NEXT` edge is maintained.
 
+## Notes / vault graphs (planned)
+
+The graphs above are *repository-shaped* — code paired with the documentation that describes it. A second graph shape, **vault graphs**, handles markdown-only collections (Obsidian vaults, personal note systems, long-form design-doc archives) where the meaningful cross-chunk relationships are wiki-links and tags rather than mentions of code symbols.
+
+The existing labels (`:File:Searchable`, `:Chunk`) and edges (`:OF_FILE`) carry over unchanged. The additions are:
+
+### New labels
+
+| Label | Properties | Indices |
+|---|---|---|
+| `:Tag:Searchable` | `name` (string; the tag value with the leading `#` stripped — hierarchical tags like `project/foo/bar` stored verbatim as a single name, no parent/child edges) | fulltext on `Searchable.name` |
+
+### New edges
+
+| Edge | From → To | Source |
+|---|---|---|
+| `:LINKS_TO` | chunk → file | inline `[[note-name]]` wiki-links extracted from chunk content |
+| `:TAGGED` | chunk → tag | inline `#tag` references in chunk content |
+| `:TAGGED` | file → tag | YAML front-matter `tags: [...]` (file-wide metadata) |
+
+The `:TAGGED` edge is dual-source on purpose. Inline tags are inherently chunk-scoped — `#performance` mentioned in one section says nothing about the other sections of the same file. Front-matter tags are file-wide metadata. The reader disambiguates by looking at the source-side label.
+
+### Wiki-link resolution
+
+`[[note-name]]` resolves to a `:File` whose stem (the basename without the `.md` extension) equals `note-name`. Variants:
+
+- `[[note-name#heading]]` — heading suffix is dropped at resolution time; the link still targets the file. (A future refinement could resolve to a specific `:Chunk` whose breadcrumb ends with the heading.)
+- `[[note-name|alias]]` — display alias is ignored; link target is `note-name`.
+- `[[unresolved]]` — silently dropped if no matching `:File` exists in the same vault graph. No edge written, no error.
+
+The `:Searchable` fulltext index on `name` covers the lookup.
+
+### Tag normalization
+
+Leading `#` is stripped. Hierarchical tags (`#project/foo/bar`) become a single `:Tag {name: "project/foo/bar"}` — flat, no parent edges. Front-matter tags from YAML (`tags: [foo, bar/baz]`) produce file-source `:TAGGED` edges; inline `#tag` references produce chunk-source ones.
+
+### Differences from code+docs graphs
+
+- **No `.git` walk-up.** A vault root is given explicitly (via the `repo` argument); the graph is named after that. There's no implicit ancestor lookup since vaults aren't generally git repositories.
+- **No code entities, no `:DOCUMENTS` edges.** The doc-to-code linker is a no-op against a pure vault graph (no `:Searchable` code-entity nodes to match identifier mentions against). Wiki-links and tags are the cross-chunk relationships that matter.
+- **Note count and turnover.** Vaults often hold orders of magnitude more files than repos and change continuously. Re-ingest performance becomes a real consideration; incremental ingestion (detect changed files, re-process only those) is more pressing here than for code repos.
+
+### Co-existing with code+docs graphs
+
+A repository can be both code project *and* note system: TypeScript files plus a `docs/` directory using `[[wiki-link]]` syntax for cross-references. The same FalkorDB graph holds everything — code nodes, doc chunks, wiki-link edges, tag nodes — with no schema collision. Wiki-link and tag extraction runs as an additive pass on every `.md` ingestion; files that don't use the syntax produce no extra edges.
+
+### Future relationships (out of scope for the initial vault implementation)
+
+- **`:SIMILAR_TO {score}`** — pre-computed chunk-to-chunk vector-similarity edges, written at ingest time. Partially redundant with on-demand KNN; deferred until a concrete use case demands stored similarity.
+- **`:MENTIONS`** — fuzzy name match across notes (analogous to the doc→code linker, but with `:File.name` as the candidate set). Considered if wiki-link-only proves too sparse on poorly-linked vaults.
+- **`:Chunk`-anchored wiki-link targets** — resolving `[[note#heading]]` to a specific chunk rather than the file. Requires breadcrumb-tail matching at link time.
+
 ## MCP tool surface
 
 Defined in `cmd/ingest/main.go`. Inputs are Go structs with `jsonschema` tags; the SDK generates the JSON Schema clients see.
