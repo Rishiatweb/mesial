@@ -329,6 +329,126 @@ func TestFactsBackedByObservations(t *testing.T) {
 	}
 }
 
+func TestLinkEvidenceForRejectsMissingNodes(t *testing.T) {
+	store := newMemoryTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureMemoryIndex(ctx, testDim); err != nil {
+		t.Fatal(err)
+	}
+	obsID, err := store.AddObservation(ctx, "real obs", vec(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	factID, err := store.AddFact(ctx, "S", "p", "O")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing fact.
+	if err := store.LinkEvidenceFor(ctx, obsID, 99999); err == nil {
+		t.Errorf("expected error linking to non-existent fact")
+	}
+	// Missing observation.
+	if err := store.LinkEvidenceFor(ctx, 99999, factID); err == nil {
+		t.Errorf("expected error linking from non-existent observation")
+	}
+	// Both real — should succeed.
+	if err := store.LinkEvidenceFor(ctx, obsID, factID); err != nil {
+		t.Errorf("valid pair: %v", err)
+	}
+}
+
+func TestLinkMotivatesRejectsMissingNodes(t *testing.T) {
+	store := newMemoryTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureCodeIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureMemoryIndex(ctx, testDim); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _ := store.AddFile(ctx, "/tmp/x.md", "x.md", ".md")
+	_, _ = store.StoreChunks(ctx, fakeChunks(1), [][]float32{vec(1)}, []int64{fileID})
+	rows, _ := store.FetchChunks(ctx, "/tmp/x.md")
+	chunkID := rows[0].ID
+	obsID, _ := store.AddObservation(ctx, "obs", vec(2))
+
+	if err := store.LinkMotivates(ctx, 99999, obsID); err == nil {
+		t.Errorf("expected error for missing chunk")
+	}
+	if err := store.LinkMotivates(ctx, chunkID, 99999); err == nil {
+		t.Errorf("expected error for missing observation")
+	}
+	if err := store.LinkMotivates(ctx, chunkID, obsID); err != nil {
+		t.Errorf("valid pair: %v", err)
+	}
+}
+
+func TestGetObservationAndFact(t *testing.T) {
+	store := newMemoryTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureMemoryIndex(ctx, testDim); err != nil {
+		t.Fatal(err)
+	}
+	obsID, _ := store.AddObservation(ctx, "the body", vec(1))
+	factID, _ := store.AddFact(ctx, "X", "is_a", "Y")
+
+	rec, err := store.GetObservation(ctx, obsID)
+	if err != nil {
+		t.Fatalf("GetObservation: %v", err)
+	}
+	if rec.ID != obsID || rec.Content != "the body" || rec.CreatedAt == 0 {
+		t.Errorf("got %+v", rec)
+	}
+	if rec.LastDistilledAt != 0 {
+		t.Errorf("expected LastDistilledAt unset, got %d", rec.LastDistilledAt)
+	}
+
+	frec, err := store.GetFact(ctx, factID)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if frec.ID != factID || frec.Subject != "X" || frec.Predicate != "is_a" || frec.Object != "Y" || frec.CreatedAt == 0 {
+		t.Errorf("got %+v", frec)
+	}
+
+	if _, err := store.GetObservation(ctx, 99999); err != ErrNotFound {
+		t.Errorf("expected ErrNotFound for missing obs, got %v", err)
+	}
+	if _, err := store.GetFact(ctx, 99999); err != ErrNotFound {
+		t.Errorf("expected ErrNotFound for missing fact, got %v", err)
+	}
+}
+
+func TestEvidenceForFact(t *testing.T) {
+	store := newMemoryTestStore(t)
+	ctx := context.Background()
+	if err := store.EnsureMemoryIndex(ctx, testDim); err != nil {
+		t.Fatal(err)
+	}
+	obs1, _ := store.AddObservation(ctx, "first evidence", vec(1))
+	obs2, _ := store.AddObservation(ctx, "second evidence", vec(2))
+	factID, _ := store.AddFact(ctx, "S", "p", "O")
+	_ = store.LinkEvidenceFor(ctx, obs1, factID)
+	_ = store.LinkEvidenceFor(ctx, obs2, factID)
+
+	backers, err := store.EvidenceForFact(ctx, factID)
+	if err != nil {
+		t.Fatalf("EvidenceForFact: %v", err)
+	}
+	if len(backers) != 2 {
+		t.Errorf("expected 2 backers, got %d: %+v", len(backers), backers)
+	}
+	// Both contents should appear.
+	seen := map[string]bool{}
+	for _, b := range backers {
+		seen[b.Content] = true
+	}
+	if !seen["first evidence"] || !seen["second evidence"] {
+		t.Errorf("missing expected contents: %v", seen)
+	}
+}
+
 func TestSearchFacts(t *testing.T) {
 	store := newMemoryTestStore(t)
 	ctx := context.Background()

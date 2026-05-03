@@ -18,16 +18,18 @@ const MemoryGraphKind = "memory"
 // agents during distillation so they can decide whether to link the new
 // observation as additional evidence or propose a new triplet.
 type SimilarFact struct {
-	ID        int64
-	Subject   string
-	Predicate string
-	Object    string
+	ID        int64  `json:"id"`
+	Subject   string `json:"subject"`
+	Predicate string `json:"predicate"`
+	Object    string `json:"object"`
 }
 
 // AddObservationResult is what AddObservation returns to its caller (CLI or MCP).
+// SimilarFacts is always non-nil — empty slice rather than null — so JSON
+// consumers see a consistent shape.
 type AddObservationResult struct {
-	ObservationID int64
-	SimilarFacts  []SimilarFact
+	ObservationID int64         `json:"observation_id"`
+	SimilarFacts  []SimilarFact `json:"similar_facts"`
 }
 
 // EnsureMemoryReady ensures the GraphMeta singleton exists with the right kind,
@@ -81,8 +83,12 @@ func AddObservation(ctx context.Context, store *falkorstore.Store, embedder *emb
 		return AddObservationResult{}, fmt.Errorf("adding observation: %w", err)
 	}
 
+	// Always return a non-nil SimilarFacts slice so JSON consumers see a
+	// consistent [] for empty results (vs. null on missing fields).
+	result := AddObservationResult{ObservationID: obsID, SimilarFacts: []SimilarFact{}}
+
 	if len(hits) == 0 {
-		return AddObservationResult{ObservationID: obsID}, nil
+		return result, nil
 	}
 	neighbors := make([]int64, 0, len(hits))
 	for _, h := range hits {
@@ -95,23 +101,22 @@ func AddObservation(ctx context.Context, store *falkorstore.Store, embedder *emb
 		}
 	}
 	if len(neighbors) == 0 {
-		return AddObservationResult{ObservationID: obsID}, nil
+		return result, nil
 	}
 
 	rows, err := store.FactsBackedByObservations(ctx, neighbors)
 	if err != nil {
 		return AddObservationResult{}, fmt.Errorf("collecting facts from neighbors: %w", err)
 	}
-	similar := make([]SimilarFact, len(rows))
-	for i, r := range rows {
-		similar[i] = SimilarFact{
+	for _, r := range rows {
+		result.SimilarFacts = append(result.SimilarFacts, SimilarFact{
 			ID:        r.ID,
 			Subject:   r.Subject,
 			Predicate: r.Predicate,
 			Object:    r.Object,
-		}
+		})
 	}
-	return AddObservationResult{ObservationID: obsID, SimilarFacts: similar}, nil
+	return result, nil
 }
 
 // LinkObservationEvidence MERGEs :EVIDENCE_FOR edges from obsID to each factID.

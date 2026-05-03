@@ -36,6 +36,12 @@ func runMemory(args []string) error {
 		return runMemorySearchObs(rest)
 	case "search-facts":
 		return runMemorySearchFacts(rest)
+	case "show-obs":
+		return runMemoryShowObs(rest)
+	case "show-fact":
+		return runMemoryShowFact(rest)
+	case "evidence":
+		return runMemoryEvidence(rest)
 	case "-h", "--help", "help":
 		memoryUsage(os.Stdout)
 		return nil
@@ -57,8 +63,11 @@ Subcommands:
   create-fact      MERGE a :Fact triplet, link to a backing :Observation (no orphan facts)
   link-evidence    MERGE :EVIDENCE_FOR edges from one observation to existing facts
   link-motivates   MERGE :MOTIVATES from an :Observation to a :Chunk
-  search-obs       KNN over observations
+  search-obs       KNN over observations (returns hits with cosine distance)
   search-facts     Structural search over facts (subject/predicate/object filters)
+  show-obs         Inspect a single :Observation by ID (full record)
+  show-fact        Inspect a single :Fact by ID (full record)
+  evidence         List the :Observations backing a given :Fact via :EVIDENCE_FOR
 
 All subcommands accept the common flags (--falkor-addr, --embedding-url, --graph)
 plus --repo to target a specific per-graph store.
@@ -128,13 +137,9 @@ func runMemoryAddObs(args []string) error {
 	if err != nil {
 		return err
 	}
-	out := struct {
-		ObservationID int64                  `json:"observation_id"`
-		SimilarFacts  []pipeline.SimilarFact `json:"similar_facts"`
-	}{res.ObservationID, res.SimilarFacts}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return enc.Encode(res)
 }
 
 // --- memory create-fact ---
@@ -308,6 +313,101 @@ func runMemorySearchFacts(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(rows)
+}
+
+// --- memory show-obs ---
+
+func runMemoryShowObs(args []string) error {
+	fs := flag.NewFlagSet("memory show-obs", flag.ExitOnError)
+	cf := bindCommon(fs)
+	repo := fs.String("repo", "", "graph (default: --graph)")
+	id := fs.Int64("id", 0, "observation ID (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *id <= 0 {
+		return fmt.Errorf("--id is required")
+	}
+	graphName := memoryGraphName(*repo, *cf.graph)
+
+	store, err := falkorstore.NewStore(*cf.falkorAddr, graphName)
+	if err != nil {
+		return fmt.Errorf("connecting to FalkorDB for graph %q: %w", graphName, err)
+	}
+	defer store.Close()
+
+	rec, err := store.GetObservation(context.Background(), *id)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(rec)
+}
+
+// --- memory show-fact ---
+
+func runMemoryShowFact(args []string) error {
+	fs := flag.NewFlagSet("memory show-fact", flag.ExitOnError)
+	cf := bindCommon(fs)
+	repo := fs.String("repo", "", "graph (default: --graph)")
+	id := fs.Int64("id", 0, "fact ID (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *id <= 0 {
+		return fmt.Errorf("--id is required")
+	}
+	graphName := memoryGraphName(*repo, *cf.graph)
+
+	store, err := falkorstore.NewStore(*cf.falkorAddr, graphName)
+	if err != nil {
+		return fmt.Errorf("connecting to FalkorDB for graph %q: %w", graphName, err)
+	}
+	defer store.Close()
+
+	rec, err := store.GetFact(context.Background(), *id)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(rec)
+}
+
+// --- memory evidence ---
+
+func runMemoryEvidence(args []string) error {
+	fs := flag.NewFlagSet("memory evidence", flag.ExitOnError)
+	cf := bindCommon(fs)
+	repo := fs.String("repo", "", "graph (default: --graph)")
+	fact := fs.Int64("fact", 0, "fact ID to trace evidence for (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *fact <= 0 {
+		return fmt.Errorf("--fact is required")
+	}
+	graphName := memoryGraphName(*repo, *cf.graph)
+
+	store, err := falkorstore.NewStore(*cf.falkorAddr, graphName)
+	if err != nil {
+		return fmt.Errorf("connecting to FalkorDB for graph %q: %w", graphName, err)
+	}
+	defer store.Close()
+
+	obs, err := store.EvidenceForFact(context.Background(), *fact)
+	if err != nil {
+		return err
+	}
+	if len(obs) == 0 {
+		// :Fact with no evidence violates the no-orphan-facts invariant; surface
+		// it as an empty array (not "no results") so the caller can detect it.
+		obs = []falkorstore.ObservationRecord{}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(obs)
 }
 
 // parseInt64CSV parses "1,2,3" into []int64. Empty entries are skipped.
