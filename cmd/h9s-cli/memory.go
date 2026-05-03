@@ -56,7 +56,7 @@ Subcommands:
   add-obs          Add an :Observation; returns its ID + KNN-similar facts
   create-fact      MERGE a :Fact triplet, link to a backing :Observation (no orphan facts)
   link-evidence    MERGE :EVIDENCE_FOR edges from one observation to existing facts
-  link-motivates   MERGE :MOTIVATES from a :Chunk to an :Observation
+  link-motivates   MERGE :MOTIVATES from an :Observation to a :Chunk
   search-obs       KNN over observations
   search-facts     Structural search over facts (subject/predicate/object filters)
 
@@ -233,10 +233,10 @@ func runMemoryLinkMotivates(args []string) error {
 	}
 	defer store.Close()
 
-	if err := pipeline.LinkChunkMotivatesObservation(context.Background(), store, *chunk, *obs); err != nil {
+	if err := pipeline.LinkObservationMotivatesChunk(context.Background(), store, *obs, *chunk); err != nil {
 		return err
 	}
-	fmt.Printf("Linked :Chunk %d -[:MOTIVATES]-> :Observation %d.\n", *chunk, *obs)
+	fmt.Printf("Linked :Observation %d -[:MOTIVATES]-> :Chunk %d.\n", *obs, *chunk)
 	return nil
 }
 

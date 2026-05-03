@@ -51,7 +51,7 @@ A predicate kernel of seven well-known relations (`is_a`, `subtype_of`, `part_of
 Across all three graph kinds, mesial separates a **perceptual** layer (literal text + embeddings) from a **conceptual** layer (structured nodes queried by name and structure). The two layers interlock through edges:
 
 ```
-:Fact ← :EVIDENCE_FOR ← :Observation ← :MOTIVATES ← :Chunk → :DOCUMENTS → :CodeEntity
+:Fact ← :EVIDENCE_FOR ← :Observation -[:MOTIVATES]→ :Chunk -[:DOCUMENTS]→ :CodeEntity
 ```
 
 The conceptual layer (`:Fact`, `:CodeEntity`, `:File`) doesn't carry its own embeddings. It inherits semantic locality through its anchors in the perceptual layer (`:Observation`, `:Chunk`). Asking "what do I know about deployment?" is a vector search over observations and chunks, then a structural traversal into the facts and code entities they touch — two hops, one embedding, no duplicated representation.

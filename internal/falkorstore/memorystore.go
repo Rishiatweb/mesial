@@ -182,8 +182,14 @@ func (s *Store) LinkEvidenceFor(ctx context.Context, obsID, factID int64) error 
 	return nil
 }
 
-// LinkMotivates MERGEs (:Chunk)-[:MOTIVATES]->(:Observation) by IDs and sets
+// LinkMotivates MERGEs (:Observation)-[:MOTIVATES]->(:Chunk) by IDs and sets
 // chunk.last_distilled_at = current ms (only if not already set). Idempotent.
+//
+// Direction is intentional: an observation *motivates* a chunk's existence in
+// the docs — chunks are documented manifestations of observations the agent has
+// made. A chunk without any incoming :MOTIVATES is unverified material; reading
+// it must produce an observation (which is then linked via this edge) for the
+// chunk to be considered "alive" in the system.
 func (s *Store) LinkMotivates(ctx context.Context, chunkID, obsID int64) error {
 	params := map[string]interface{}{
 		"chunk": chunkID,
@@ -192,12 +198,12 @@ func (s *Store) LinkMotivates(ctx context.Context, chunkID, obsID int64) error {
 	}
 	_, err := s.graph.Query(
 		"MATCH (c:Chunk), (o:Observation) WHERE ID(c) = $chunk AND ID(o) = $obs "+
-			"MERGE (c)-[:MOTIVATES]->(o) "+
+			"MERGE (o)-[:MOTIVATES]->(c) "+
 			"SET c.last_distilled_at = coalesce(c.last_distilled_at, $now)",
 		params, nil,
 	)
 	if err != nil {
-		return fmt.Errorf("linking motivates (chunk=%d, obs=%d): %w", chunkID, obsID, err)
+		return fmt.Errorf("linking motivates (obs=%d, chunk=%d): %w", obsID, chunkID, err)
 	}
 	return nil
 }

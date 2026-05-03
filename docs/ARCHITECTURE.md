@@ -130,7 +130,7 @@ Each graph carries a singleton `(:GraphMeta {kind, strict})` node — the in-gra
 - `kind` ∈ `code | notes | memory`. Decided at graph creation; resolved by the ingest path (a `.git` walk-up implies `code`; the planned vault ingest implies `notes`; the memory graph is opened by name).
 - `strict` (default `false`) controls how off-vocabulary writes are handled. With `strict: false`, the writer emits whatever it finds — a `code` graph may also accumulate `:Fact` nodes, a vault may also accumulate `:DOCUMENTS` edges if it happens to mention code-entity names. `strict: true` (future) would have the pipeline reject off-vocabulary writes for graphs that need a tightly enforced shape.
 
-The default of `strict: false` everywhere is deliberate. Most observations about a repo's code belong in that repo's graph (`(:Chunk)-[:MOTIVATES]->(:Observation)` plus the chunk's own `(:Chunk)-[:DOCUMENTS]->(:Class {name:'EventViewImpl'})` — same graph, queryable in one place). The `memory` graph is reserved for material that is genuinely cross-cutting or has no single subject (preferences, working style, multi-repo observations).
+The default of `strict: false` everywhere is deliberate. Most observations about a repo's code belong in that repo's graph (`(:Observation)-[:MOTIVATES]->(:Chunk)` plus the chunk's own `(:Chunk)-[:DOCUMENTS]->(:Class {name:'EventViewImpl'})` — same graph, queryable in one place). The `memory` graph is reserved for material that is genuinely cross-cutting or has no single subject (preferences, working style, multi-repo observations).
 
 ## Data model
 
@@ -140,7 +140,7 @@ The default of `strict: false` everywhere is deliberate. Most observations about
 |---|---|---|
 | `:File:Searchable` | `path`, `name`, `ext` | range on `(name, ext)`, fulltext on `Searchable.name` |
 | `:Class` `:Function` `:Method` `:Constructor` `:Interface` `:Enum` (each `:Searchable`) | `name`, `path`, `src_start`, `src_end`, `doc` | fulltext on `Searchable.name` |
-| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector), `last_distilled_at` (ms, optional — set when this chunk has motivated at least one `:Observation`) | vector (cosine, 512-dim) on `Chunk.vector` |
+| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector), `last_distilled_at` (ms, optional — set when at least one `:Observation` has motivated this chunk via `:MOTIVATES`) | vector (cosine, 512-dim) on `Chunk.vector` |
 
 ### Edges
 
@@ -242,11 +242,13 @@ The conceptual layer doesn't need its own embeddings: it inherits semantic local
 The strict layer order is enforced by the edges:
 
 ```
-:Fact ← :EVIDENCE_FOR ← :Observation ← :MOTIVATES ← :Chunk → :DOCUMENTS → :CodeEntity
-                                                     └ :OF_FILE → :File
+:Fact ← :EVIDENCE_FOR ← :Observation -[:MOTIVATES]→ :Chunk -[:DOCUMENTS]→ :CodeEntity
+                                                    └ :OF_FILE → :File
 ```
 
 `:Observation` does not link directly to `:CodeEntity` — it goes through a `:Chunk`. If an agent wants to anchor an observation to a code entity that has no documenting chunk, the right move is to write the doc first; this preserves the "facts not in chunks are a smell" rule.
+
+**Why `:MOTIVATES` points from observation to chunk** (and not the other way): chunks are documented manifestations of agent-noticed observations. A chunk *needs* to be motivated by at least one observation to count as live, verified material in the system; a chunk with no incoming `:MOTIVATES` is unverified content that hasn't been engaged with. The agent's job, when it reads such a chunk, is either to make an observation about it (which then anchors via this edge — a kind of read-time verification) or to flag it for removal/update. The direction encodes an epistemological stance: documentation is not authoritative by virtue of existing; it earns its place by being grounded in observations the agent has either made or read and re-affirmed.
 
 ### New labels
 
@@ -266,7 +268,7 @@ Notes:
 | Edge | From → To | Meaning |
 |---|---|---|
 | `:EVIDENCE_FOR` | `:Observation` → `:Fact` | The observation provides episodic backing for the semantic fact. **Required:** every `:Fact` must have ≥ 1 incoming `:EVIDENCE_FOR`. Facts without grounding don't enter the graph. |
-| `:MOTIVATES` | `:Chunk` → `:Observation` | (Optional, many-to-many) Reading this chunk prompted that observation. Captures the causal direction (chunk is the *occasion* for the observation) without claiming the observation is *derived from* or *justified by* the chunk's content. Pure runtime observations (not prompted by any chunk) have no incoming `:MOTIVATES`. |
+| `:MOTIVATES` | `:Observation` → `:Chunk` | (Optional, many-to-many) The observation justifies the chunk's existence in the docs. Covers three cases under one edge: (a) the observation's content is contained in / has been written into the chunk; (b) the observation motivated the chunk being written in the first place (write-direction); (c) the observation was made while reading an existing chunk and now backs its continued inclusion (read-direction = epistemological re-affirmation). Pure runtime observations (about the project, the user, or a topic — not anchored to any chunk) have no outgoing `:MOTIVATES`. |
 
 `:EVIDENCE_FOR` replaces the earlier `:SUPPORTS` — "evidence for" is epistemically more honest, claiming inductive backing rather than implying deductive proof.
 
@@ -351,11 +353,11 @@ WHERE NOT (o)-[:EVIDENCE_FOR]->()
   AND o.created_at < timestamp() - 30*86400000
 RETURN o
 
-// chunks that have never motivated an observation → attention gaps
-MATCH (c:Chunk) WHERE NOT (c)-[:MOTIVATES]->() RETURN c
+// chunks not yet motivated by any observation → unverified material
+MATCH (c:Chunk) WHERE NOT (c)<-[:MOTIVATES]-() RETURN c
 
-// what observations were prompted by chunks documenting EventViewImpl? (perceptual → conceptual traversal)
-MATCH (:Searchable {name:'EventViewImpl'})<-[:DOCUMENTS]-(:Chunk)-[:MOTIVATES]->(o:Observation)
+// what observations motivate chunks that document EventViewImpl? (conceptual ← perceptual traversal)
+MATCH (:Searchable {name:'EventViewImpl'})<-[:DOCUMENTS]-(c:Chunk)<-[:MOTIVATES]-(o:Observation)
 OPTIONAL MATCH (o)-[:EVIDENCE_FOR]->(f:Fact)
 RETURN o.content, collect({subject:f.subject, predicate:f.predicate, object:f.object}) AS facts
 ```
@@ -365,7 +367,7 @@ RETURN o.content, collect({subject:f.subject, predicate:f.predicate, object:f.ob
 The schema is permissive; the discipline lives in the skill the agent runs:
 
 - **No orphan facts.** Every `:Fact` has ≥ 1 incoming `:EVIDENCE_FOR`. Direct fact writes are forbidden — distillation (observation first, then fact derived from it) is the only entry path.
-- **Chunks before observations about code.** An observation about a code-repo context must be motivated by an existing `:Chunk` (i.e. `(:Chunk)-[:MOTIVATES]->(:Observation)`). If the relevant chunk doesn't exist yet, write the doc first.
+- **Observations motivate chunks; chunks need observations.** When an agent reads or writes a chunk, it should anchor its takeaway as an `:Observation` linked via `(:Observation)-[:MOTIVATES]->(:Chunk)`. A chunk with no incoming `:MOTIVATES` is unverified material — either to be engaged with (and an observation made) or pruned. Conversely, when an agent has an observation about a code entity that has *no* documenting chunk yet, the right move is to write the doc first; this preserves the layer separation (observations reach code entities only through chunks).
 - **Resolve contradictions on detection.** Write-time semantic search over nearby observations surfaces conflicts; structural check on candidate fact triplets against existing facts catches the rest. Resolve before storing — re-check against code, docs, or user.
 - **Distill at runtime via the agent.** Distillation is intended to be agent-orchestrated through the MCP surface (multi-turn: write observation → server returns similar facts → agent decides which to link or whether to propose a new triplet). Tool design deferred until data design is fully ratified.
 

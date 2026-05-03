@@ -150,10 +150,12 @@ func CreateFactFromObservation(ctx context.Context, store *falkorstore.Store, ob
 	return factID, nil
 }
 
-// LinkChunkMotivatesObservation writes the :MOTIVATES edge anchoring an
-// observation to the chunk that prompted it. Idempotent; sets the chunk's
-// last_distilled_at timestamp on first link only.
-func LinkChunkMotivatesObservation(ctx context.Context, store *falkorstore.Store, chunkID, obsID int64) error {
+// LinkObservationMotivatesChunk writes the :MOTIVATES edge from an observation
+// to the chunk it justifies. Direction encodes the epistemological stance:
+// observations are the underlying epistemic units; chunks are their documented
+// crystallizations and need an observation to back them. Idempotent; sets the
+// chunk's last_distilled_at timestamp on first link only.
+func LinkObservationMotivatesChunk(ctx context.Context, store *falkorstore.Store, obsID, chunkID int64) error {
 	return store.LinkMotivates(ctx, chunkID, obsID)
 }
 
