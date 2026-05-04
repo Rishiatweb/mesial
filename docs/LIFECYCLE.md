@@ -1,97 +1,373 @@
 # Lifecycle
 
-How a repository moves through mesial — from empty graph, through ingestion, through observation and fact creation, into ongoing online use. This document is **prescriptive about the design** but only the layers up through `:Fact` are implemented today; sections 5–9 describe the MCP surface and inference engine that follow PR #5 (the memory layer foundation).
+How a repository moves through mesial — over time, with the agent in the loop.
 
-Companion to [`DESIGN.md`](DESIGN.md) (the conceptual model) and [`ARCHITECTURE.md`](ARCHITECTURE.md) (the engineering view). This doc is about *time* — what happens when, in what order, and by whose action.
+This document is **online-first**: most of mesial's value comes from constant background utility during ordinary developer work, not from a one-time bootstrap pass. The bootstrap (deterministic ingestion) is the substrate; online use is the point. The earlier draft of this doc had that backwards — substrate was front-loaded and online use was an appendix. The current order corrects that.
 
----
-
-## 1. Initialization
-
-The point at which mesial knows *of* a repository but not yet anything about it.
-
-### Empty repository (rare in practice)
-
-A new project with no code and no docs. Initialization writes only the singleton:
-
-```
-h9s-cli memory init --repo {name}
-```
-
-This creates `(:GraphMeta {kind, strict})` with the appropriate `kind`:
-- `code` for software repositories
-- `notes` for vault-style markdown collections (Obsidian, etc.)
-- `memory` for the global cross-cutting graph
-
-It also creates the indexes the corresponding kind will need (vector index on `:Chunk` / `:Observation`, range indexes on `:Fact` for `code` and `memory`; tag indexes for `notes`).
-
-### Implicit initialization on first ingest
-
-For the typical case (a repo with existing code or docs), `analyze_repository` and `ingest_documents` create the graph implicitly: if the per-repo graph doesn't exist, FalkorDB creates it on first write, and the ingest pipeline writes `:GraphMeta` as part of its setup.
-
-The explicit `memory init` only needs to be called when:
-- Bootstrapping the global `memory` graph (no analyze pass to trigger it implicitly)
-- Asserting the kind upfront (e.g., to claim a graph as `notes` when it would otherwise be inferred as `code` from a `.git` ancestor)
-- Re-affirming `strict` after changing the policy
-
-### What's *not* in the graph yet
-
-After initialization (without ingestion), the graph contains exactly one node (`:GraphMeta`). No code entities, no chunks, no observations, no facts. The agent can write directly to it via the memory MCP tools (Section 5+) — useful for `memory`-kind graphs that have no source material to ingest.
+Companion to [`DESIGN.md`](DESIGN.md) (the conceptual model) and [`ARCHITECTURE.md`](ARCHITECTURE.md) (the engineering view). This doc is about *time* — what happens when, in what order, by whose action.
 
 ---
 
-## 2. Onboarding from already-started repos
+## The seven-loop spine
 
-The dominant case: a real repository with existing TypeScript code and markdown docs, never seen by mesial before. One command:
+Every interaction with mesial — bootstrap or online — is some composition of seven loops:
 
 ```
-h9s-cli analyze --path /path/to/repo
+1. Anchor    Text/code becomes graph nodes with stable identity that survive churn.
+2. Surface   A task / query / file produces a useful context subgraph.
+3. Act       The agent edits, tests, investigates, reviews, decides.
+4. Capture   Important discoveries from the act become observations.
+5. Distill   Repeated or high-confidence observations become facts (or protocols).
+6. Verify    Facts, anchors, evidence, and coverage are checked against current code.
+7. Repair    Broken anchors, stale docs, stale facts, coverage gaps become queues, not silent decay.
 ```
 
-The orchestrator runs four passes against a graph named after the `.git` ancestor:
+The design earlier in this project's history under-emphasized **Repair**. A memory system that cannot repair itself becomes archaeological — verification finds nothing wrong because the verification target has drifted. A memory system that continuously repairs itself becomes infrastructure. The lifecycle below treats repair as first-class.
 
-1. **Tree-sitter pass** — walks the source tree, parses each `.ts`/`.tsx` file, emits `:File`, `:Class`, `:Function`, `:Method`, `:Constructor`, `:Interface`, `:Enum` nodes plus `:DEFINES` edges (file → entity, class → method, etc.).
-2. **LSP pass** — opens `typescript-language-server` against the same tree, resolves cross-references: `:CALLS`, `:EXTENDS`, `:IMPLEMENTS`, `:RETURNS`, `:PARAMETERS`.
-3. **Doc ingestion pass** — walks the same tree for `.md` files, chunks each by heading boundary, embeds each chunk (Qwen3, 512-dim Matryoshka), creates `:Chunk` nodes with `:OF_FILE` edges.
-4. **Doc-to-code linker pass** — scans every chunk for identifier mentions (backtick-fenced or PascalCase/snake_case bare tokens) that match a known `:Searchable` name, emits `:DOCUMENTS` edges.
+## Core invariants
 
-After this completes the graph contains the full **perceptual + structural** state of the repo as it stands today. No observations, no facts. The agent has a navigable map but no opinions yet.
+What must remain true for mesial to be trustworthy:
 
-### Re-onboarding (idempotent)
+1. **Durable claims are evidence-backed.**
+   No `:Fact` exists without at least one `:Observation` linked via `:EVIDENCE_FOR`. Free-floating LLM assertions don't enter the conceptual layer.
 
-`analyze_repository` is safe to re-run. Code entities are MERGE'd by `(name, path, src_start, src_end)` — moved code re-adds, deleted code is left as a stale node (cleanup is a future concern). Doc chunks are deleted-and-recreated per source file (`DETACH DELETE` on the source path before re-chunking), so all `:Chunk` IDs change on each run; downstream `:MOTIVATES` edges that pointed at the old chunks are dropped along with them. **Implication for online use:** observations should re-link to chunks after a doc edit, ideally automatically.
+2. **Anchors are repairable.**
+   Observations and facts must survive ordinary code/doc churn. Chunk regeneration cannot silently disconnect them; re-anchoring is a built-in operation, not a manual rescue.
+
+3. **Online use is the primary write path.**
+   The highest-value memory is captured during real developer work — when the agent has just paid the cost of understanding something. Offline corpus distillation is a fallback, not the default.
+
+4. **Verification is scoped.**
+   Logical, structural, evidence, anchor, and coverage verification are separate checks with separate signals. Lumping them masks failures.
+
+5. **Repair is a first-class lifecycle phase.**
+   Broken anchors, stale docs, stale facts, and coverage gaps become explicit queues that the agent (or scheduled jobs) work through. Decay is observable, not silent.
+
+These invariants govern every concrete decision below.
 
 ---
 
-## 3. Ingestion (mechanical)
+## Online lifecycle (primary)
 
-Already implemented. Brief enumeration:
+The everyday loop. Agent does work; mesial is in the loop continuously, both as a context provider (read) and as a memory accumulator (write).
 
-| Asset | Pipeline | Output |
+### Conceptual frame: three modes
+
+Mesial usage decomposes into three modes:
+
+- **Semantic mode** — vector search over chunks/observations to find relevant material. *"What does the codebase say about X?"*
+- **Logical mode** — structural queries over the code graph + (eventually) inference over facts. *"What are the consequences of changing X?"*
+- **Combined mode** — semantic search to find candidates, then logical traversal/inference to validate or expand. *"Find code likely related to X, then check whether changing it would break invariants."*
+
+The interesting questions are mostly *combined*. Semantic alone is grep-with-vibes. Logical alone is grep-with-structure. The combination is what justifies the architecture.
+
+### Agent moments
+
+The online lifecycle is organized around **agent moments** — the points in real work when an agent should call mesial. Each moment names: the trigger, the primitive call, what mesial returns, what the agent does with it.
+
+#### Moment 1: Task starts
+
+- *Trigger*: agent receives a new task (bug report, feature request, refactor brief, etc.).
+- *Call*: `surface(task_description, depth=full)`.
+- *Returns*: a context subgraph — relevant chunks, code entities, observations, facts, with confidence indicators.
+- *Agent action*: load the subgraph as initial context. This replaces 50–80% of the "where do I start?" exploratory grep loop.
+
+#### Moment 2: File opened
+
+- *Trigger*: agent opens a file it hasn't seen this session.
+- *Call*: `surface(file_path, depth=tour)`.
+- *Returns*: file's defined entities, their cross-references (calls, extends, implements), documenting chunks, observations and facts about those entities.
+- *Agent action*: structured tour rather than blind read. *"This file defines X (extends Y, called by Z); X is documented in chunk Q which says ..."*.
+
+#### Moment 3: Symbol edited
+
+- *Trigger*: agent changes a function/method/class signature, removes an entity, etc.
+- *Call*: `impact(symbol, kinds=[CALLS, DOCUMENTS, EVIDENCE_FOR, ABOUT])`.
+- *Returns*: dependents stratified by edge kind: callers (must update), documenting chunks (review docs), observations and facts that mention the symbol (re-verify).
+- *Agent action*: a checklist of impact sites, prioritized. Optionally followed by `verify(facts_about_symbol)` after the change to flag broken claims.
+
+#### Moment 4: Unexpected behavior found / convention learned
+
+- *Trigger*: agent notices something during work — a function silently truncates inputs, a flag gates an unexpected path, a convention is stricter than docs say, etc.
+- *Call*: `add_observation(text)` (single-shot; KNN against existing observations runs server-side).
+- *Returns*: the observation ID + similar existing observations + facts those observations back. The KNN pass surfaces whether this is a known issue or a fresh discovery.
+- *Agent action*: optionally refine the observation given the surfaced context, then commit via `confirm_observation`. The user is the commit gate.
+
+#### Moment 5: Before commit / PR
+
+- *Trigger*: agent is about to create a commit or open a PR.
+- *Calls*: `verify_changed_entities(file_paths)` + `verify_docs_for_changed_entities(file_paths)`.
+- *Returns*: facts that would now be contradicted by the change; chunks documenting changed entities (likely stale); observations about the entities (re-verify candidates).
+- *Agent action*: address the report before opening the PR — update docs, retract or amend stale facts, re-affirm observations that survived the change.
+
+#### Moment 6: Graph drift detected (post-merge / scheduled)
+
+- *Trigger*: a merge changed source files; or a scheduled drift check.
+- *Calls*: `reanchor(repo, changed_sources)` followed by `hygiene_queue("stale_docs" | "broken_anchors" | "stale_facts")`.
+- *Returns*: re-anchored chunk/observation pairs (with confidence); orphaned anchors that need human review; queues of items to re-verify.
+- *Agent action*: clear queues opportunistically (when otherwise idle) or pull explicitly during dedicated maintenance windows.
+
+### Agent trigger policy
+
+The same content as the moments above, condensed into an operating manual the agent skill can follow without ambiguity:
+
+| Trigger | Primitive |
+|---|---|
+| Task starts | `surface(task)` |
+| File opened | `surface(file_path)` |
+| Symbol edited | `impact(symbol)` |
+| Unexpected behavior found / convention learned | `add_observation(text)` |
+| Before commit / PR | `verify_changed_entities(files)` + `verify_docs_for_changed_entities(files)` |
+| After merge / on schedule | `reanchor(changed_sources)` + `hygiene_queue(kind)` |
+
+If the agent skill follows this policy, every commit cycle automatically passes through Anchor → Surface → Act → Capture → Verify → Repair without the agent having to remember which call to make when.
+
+### Backbone primitives
+
+Six primitives compose every scenario above:
+
+| Primitive | Signature (sketch) | Implements |
 |---|---|---|
-| TypeScript files | tree-sitter + LSP | `:File`, `:Class`, `:Function`, `:Method`, `:Constructor`, `:Interface`, `:Enum` + `:DEFINES`/`:CALLS`/`:EXTENDS`/`:IMPLEMENTS`/`:RETURNS`/`:PARAMETERS` |
-| Markdown files | heading chunker + Qwen3 embedder | `:Chunk` (with vector or `oversized=true`) + `:OF_FILE` |
-| Identifier mentions in chunks | `internal/doclinker` regex scanner | `:DOCUMENTS` edges (chunk → code entity) |
+| `surface` | `surface(query|path, depth) → context_subgraph` | Pattern 1 (semantic-then-traverse) |
+| `propose_then_confirm` | `propose_X(items) → session_id, proposed[]; confirm_X(session_id, accepted[]) → committed_ids` | Pattern 3 (KNN-cluster-confirm) |
+| `impact` | `impact(entity, kinds[]) → dependent_set` | Pattern 4 (edge-traversal as impact) |
+| `verify` | `verify(scope, target_ids?) → report` | Pattern 2 (triplet-against-code) |
+| `hygiene_queue` | `hygiene_queue(kind) → items[]` | Pattern 5 (time-driven maintenance) |
+| `reanchor` | `reanchor(repo, changed_sources?) → ReanchorReport` | Repair loop |
 
-This is the deterministic side of mesial — same inputs, same outputs, no LLM in the loop. Sections 4 onward bring the LLM into the pipeline as the source of *interpretation*.
+`reanchor` is new compared to the previous draft — promoted from "implementation detail" to a backbone primitive because anchor stability is load-bearing for every other primitive (see [Anchor stability](#anchor-stability-and-re-anchoring) below).
+
+### `surface` response shape (MVP + extension)
+
+`surface` is the most-called primitive — its response shape needs to be designed for evolution from day one. MCP response schemas are easy to add fields to (clients ignoring unknown fields), hard to restructure once shipped.
+
+**MVP shape (v1):**
+
+```json
+{
+  "version": 1,
+  "chunks": [{"id": "...", "content": "...", "source": "...", "breadcrumb": "..."}],
+  "entities": [{"id": "...", "label": "...", "name": "...", "path": "..."}],
+  "observations": [{"id": "...", "content": "...", "fact_ids": ["..."]}],
+  "confidence": {
+    "retrieval": 0.0,
+    "coverage": 0.0,
+    "staleness": 0.0
+  }
+}
+```
+
+`confidence` is intentionally a block (not three top-level fields) so it can grow without polluting the root.
+
+**Reserved for v2+ (added without breaking clients):**
+
+- `facts[]` — full triplets, not just IDs
+- `risks[]` — surfaced from facts that mark deprecated/incompatible/unstable
+- `open_questions[]` — areas with low coverage relevant to the query
+- `suggested_next_queries[]` — agent skill hints for follow-up
+
+The discipline: **never remove or repurpose a field**, always extend. Versioning lets clients negotiate (`accept-version` or equivalent) for major changes.
+
+### Recurring patterns
+
+The backbone primitives implement six patterns that show up across scenarios:
+
+#### Pattern 1: Semantic-then-traverse (workhorse)
+`vector search → graph traversal → context assembly`. Used by every reactive load (Moments 1, 2, partially 3).
+
+#### Pattern 2: Triplet-against-code (the bridge)
+`fact triplet → resolve subject/object to code entities → check relation in code graph`. The bridge between semantic and logical layers. Used by `verify` (most scopes), Moment 5.
+
+#### Pattern 3: KNN-then-cluster-then-confirm (human-in-loop primitive)
+`group similar items → present to user → batch commit confirmed`. The MCP elicitation pattern. Used by all distillation flows (bootstrap interview, runtime observation capture, fact generation, conflict resolution).
+
+#### Pattern 4: Edge-traversal-as-impact (change analysis)
+`from changed entity → traverse incoming edges → enumerate dependents`. Reduces "what depends on X?" to a graph query. Used by Moment 3, refactoring, PR review, dead-code detection.
+
+#### Pattern 5: Time-driven maintenance queues (hygiene)
+`property timestamp + age threshold → review queue`. Used by `hygiene_queue` for stale docs, orphan observations, fact verification staleness.
+
+#### Pattern 6: Combined semantic + logical (most powerful)
+`semantic to find candidates → logical to validate or expand`. Most of the high-leverage scenarios live here.
+
+### Prioritization
+
+Updated to put online use ahead of corpus distillation. The previous tier order had bootstrap interview as Tier 1; this version moves it later, after the online primitives.
+
+**Tier 1 — must-have for "useful coding agent"**:
+- `surface` (MVP shape) — Moment 1, Moment 2
+- Stable chunk/entity identity + `reanchor` — anchor invariant must hold before any deep memory work
+- `add_observation` runtime capture (Moment 4) — the primary write path per Invariant 3
+- `impact` (Moment 3) — change-management primitive, daily-use payoff
+
+**Tier 2 — force multipliers**:
+- `hygiene_queue` (Moment 6) — keeps Tier 1 from rotting
+- Bootstrap interview as one of multiple population paths (Section: [Population strategies](#population-strategies))
+- Diff-driven population from PR events
+- `verify` (anchor + structural scopes — Moment 5)
+
+**Tier 3 — advanced reasoning**:
+- Fact generation flow over accumulated observations
+- `verify` (logical + evidence scopes)
+- `:Protocol` ingestion and consumption ([Issue #6](https://github.com/mknw/mesial/issues/6))
+- `:Test` / `:Failure` ingestion ([Issue #9](https://github.com/mknw/mesial/issues/9))
+
+**Tier 4 — late / specialized**:
+- Doc generation, migration planning, security audit, feature-flag mapping, dead-code detection
+- Self-monitoring meta-loops
+- Forward chaining inference (`dlpfc`'s deeper reasoning)
+
+The most leveraged near-term outcome is not "the graph can infer deep truths." It is: **a coding agent starts a task, gets the right context, changes code, updates the graph, and leaves the next agent smarter than it was.**
 
 ---
 
-## 4. Observation creation: the "interview"
+## Anchor stability and re-anchoring
 
-Observations don't fall out of files mechanically. They're produced by an LLM reading chunks and writing what it notices. The naive approach — show the agent one chunk and ask "what do you observe?" — produces shallow, locally-scoped observations. The interview approach forces global thinking by presenting **groups of related chunks** and asking the agent to write observations that span them.
+The load-bearing risk for the memory layer. `analyze_repository` deletes-and-recreates `:Chunk` nodes on each run (the chunk IDs change), which silently drops every `:MOTIVATES` edge that pointed at the old chunks. Observations and facts then become disconnected from the documented evidence that grounded them. Verification will appear correct while the underlying ground has shifted.
 
-### Grouping strategy
+### Stable identity properties
 
-Three signals available, used together rather than in sequence:
+Add to `:Chunk` (similar treatment for `:CodeEntity`):
 
-1. **Vector similarity (KNN over chunk embeddings).** Surfaces chunks that talk about overlapping topics regardless of file location. Primary clustering signal.
-2. **Shared `:DOCUMENTS` targets.** Chunks that document the same code entity belong together — they're describing the same subject from different angles. Used as a structural boost on top of vector similarity.
-3. **Breadcrumb prefix locality / same source file.** Chunks from the same heading section in the same file have local coherence. Smaller boost.
+- `content_hash` — hash of normalized chunk content (whitespace-normalized so trivial reformatting doesn't invalidate)
+- `breadcrumb_hash` — hash of the heading path
+- Composite key: `source_path + breadcrumb_hash + content_hash` survives most edits
 
-### Cluster identification (used by §4 and §7)
+For `:CodeEntity`: a stable identity beyond `(name, path, src_start, src_end)` — likely `(name, path, signature_hash)` so line shifts don't break identity.
 
-Both the chunk interview (§4) and the fact-generation step (§7) need **clusters of related items** — same algorithm, different inputs. The clustering must satisfy three constraints simultaneously:
+### Re-anchoring algorithm (sketch)
+
+When chunks are regenerated:
+1. Match new chunks to old by `source_path + breadcrumb_hash` (high confidence)
+2. Fall back to `source_path + content_hash` (handles renamed sections)
+3. Fall back to vector similarity over old/new embeddings + shared `:DOCUMENTS` targets (lower confidence)
+4. Surface unmappable old chunks as orphaned for review
+5. Replay `:MOTIVATES` edges from old → new with confidence scores attached
+
+Below a confidence threshold, re-linked observations queue for human review via `propose_then_confirm`.
+
+### `reanchor` primitive
+
+```
+reanchor(repo, changed_sources?) → ReanchorReport {
+  remapped: [{old_chunk_id, new_chunk_id, confidence, edges_replayed}],
+  ambiguous: [{old_chunk_id, candidate_new_chunk_ids}],
+  orphaned: [{old_chunk_id, observation_ids_affected}],
+  created_anew: [new_chunk_ids],
+}
+```
+
+Full design in **[Issue #8](https://github.com/mknw/mesial/issues/8)**. Implementation lands before fact-generation work — Invariant 2 demands it.
+
+---
+
+## Diff as synchronization signal
+
+Treat git diff as a first-class **event source**. A merged change emits typed events the maintenance system consumes:
+
+| Event | Source | Triggered actions |
+|---|---|---|
+| `CodeEntityChanged` | tree-sitter delta | `verify_changed_entity`, queue documenting chunks for `verify_docs_for_changed_entity` |
+| `CodeEntityMoved` | LSP rename detection + signature_hash match | Update entity identity; re-link `:DOCUMENTS` edges to the moved entity |
+| `CodeEntityDeleted` | tree-sitter absence | Mark documenting chunks as orphaned; mark facts mentioning the entity as `needs_reverification` |
+| `ChunkChanged` | content_hash mismatch on re-chunk | `reanchor` for that chunk; queue dependent observations for confidence check |
+| `ChunkMoved` | source_path or breadcrumb change | Re-anchor with `breadcrumb_hash` match |
+| `ChunkDeleted` | source removed | Orphan the `:MOTIVATES` edges; surface affected observations |
+| `DocMentionsChanged` | linker re-scan finds new/removed identifier mentions | Update `:DOCUMENTS` edges; queue affected entities for `verify_docs_for_changed_entity` |
+| `TestTouched` | file under `/test/` changed | (Future, [Issue #9](https://github.com/mknw/mesial/issues/9)) re-link `:EXERCISES` edges |
+
+Events feed `impact`, `hygiene_queue`, `verify`, and `reanchor`. **Maintenance is event-driven first, scheduled second.** Scheduled queues exist as the safety net; events exist for the common case.
+
+This is the bridge between static graph and living codebase — the mechanism by which Invariant 5 (repair) is operationalized.
+
+---
+
+## Population strategies
+
+The conceptual layer (observations, facts, protocols) gets populated through several paths, not just the bootstrap interview. Per Invariant 3, **work-driven capture is the primary path**; the others backstop and supplement it.
+
+### Strategy 1: Work-driven observation capture (primary)
+
+What it is: when the agent finishes a meaningful work unit — fixed a bug, validated a hypothesis, learned a convention — call `add_observation` immediately with what was learned. KNN surfaces neighbors and related facts; user confirms via elicitation.
+
+High-value trigger moments:
+- After fixing a bug
+- After a failed hypothesis
+- After discovering a convention
+- After editing a public API
+- After resolving an ambiguity
+- After running tests and learning what matters
+- After reading a file with no existing observations
+
+The agent skill embeds prompts for these moments. Each one is a memory deposit.
+
+Why this is the primary path: the best memory is created when the agent has just paid the cost of understanding something. Capturing then is cheap; capturing later is much harder.
+
+### Strategy 2: PR / diff-driven extraction
+
+What it is: every diff is a structured source of candidate observations.
+
+Diff candidates:
+- Changed public API signature → "the public surface of X changed"
+- Changed function behavior → behavioral observations from the agent's understanding of the change
+- New dependency edge (new import) → architectural fact candidate
+- Deleted entity → cleanup observations
+- New test coverage → "X is now tested for behavior Y"
+- Docs changed without code → "docs updated to reflect Z"
+- Code changed without docs → docs-out-of-sync observation
+
+Per-event hooks emit candidates that go through `propose_then_confirm` like any other.
+
+### Strategy 3: Test and runtime trace ingestion ([Issue #9](https://github.com/mknw/mesial/issues/9))
+
+Tests are executable documentation. Failures captured during runs are gold-standard episodic observations.
+
+Rough shape (full design in Issue #9):
+
+```
+:Test {name, file_path, framework}
+:Failure {id, observed_at, error_text}
+(:Test)-[:EXERCISES]->(:Function | :Method | :Class)
+(:Failure)-[:OBSERVED_IN]->(:Test)
+(:Observation)-[:MOTIVATES]->(:Failure)
+```
+
+Value: "what tests exercise this function?" and "where has this code failed before?" become first-class queries instead of grep + log trawls.
+
+### Strategy 4: Commit-message and PR-review ingestion
+
+Cheap source of rationale that docs rarely capture. Commit messages and PR descriptions/reviews populate `:Observation` nodes with source provenance. Most teams already write these; mesial just files them.
+
+### Strategy 5: Protocol mining ([Issue #6](https://github.com/mknw/mesial/issues/6))
+
+Procedural knowledge — "how to do X" — is often more valuable for coding agents than declarative facts. Examples: "How to add a new MCP tool", "How to debug LSP failures", "How to release the Docker image".
+
+Proposed v1 schema (see Issue #6 for full discussion):
+
+```
+:Protocol {name, goal, preconditions[], steps[], success_signals[], failure_modes[], related_entities[]}
+```
+
+`related_entities` lets `impact(entity)` surface relevant protocols when an entity is touched.
+
+### Strategy 6: Assertion extraction from docs
+
+LLM-assisted extraction of normative sentences from existing docs:
+- "must" / "never" / "requires" / "is responsible for" / "is not" / "only" / "deprecated" / "source of truth"
+
+These become *fact candidates*, not facts. They pass through `propose_then_confirm` like everything else.
+
+### Strategy 7: Query-driven memory
+
+When `surface` returns low-confidence or sparse context, the agent prompts: "Should I create an observation from what I just learned?" Captures memory exactly where the graph failed to help — directly addresses coverage gaps.
+
+### Strategy 8: Bootstrap interview (offline, when needed)
+
+What it is: read the entire docs corpus, group chunks for global thinking, propose observations spanning each group, propose facts from observation clusters. The original lifecycle treated this as the primary populating force; Invariant 3 demotes it to one option among many — useful for *initial* population on a mature, undocumented-in-mesial repo, but not the daily mode.
+
+#### Cluster identification (used by Strategy 8 chunks and Strategy 8 / Tier 3 facts)
+
+Both the chunk interview and the fact-generation step need **clusters of related items** — same algorithm, different inputs. The clustering must satisfy three constraints simultaneously:
 
 1. **Coherence** — items in a cluster should overlap topically.
 2. **Coverage** — every item should land in some cluster (no orphans during distillation).
@@ -101,237 +377,70 @@ No off-the-shelf algorithm satisfies all three cleanly. Mesial uses a **greedy b
 
 **Inputs**: items with vectors + structural metadata; per-cluster budget (chars or tokens); similarity function.
 
-**Similarity function** (returns a value in roughly [0, 1.5]; higher = more related):
-- Base: cosine similarity between the two items' embeddings, mapped to `[0, 1]`.
-- Structural bonus when at least one shared neighbor:
+**Similarity function** (returns roughly `[0, 1.5]`; higher = more related):
+- Base: cosine similarity between embeddings, mapped to `[0, 1]`.
+- Structural bonus when sharing a neighbor:
   - For chunks: `+0.3` if they share a `:DOCUMENTS` target or breadcrumb prefix; `+0.2` if same source file.
   - For observations: `+0.3` if they share a `:MOTIVATES` target chunk; `+0.2` if motivated chunks are in the same file.
-- (Boost magnitudes are policy — tunable; the structural signals are what matters, not the exact weights.)
 
 **Algorithm**:
-1. **Index lookup** — KNN-10 over each item's vector. Single query against FalkorDB's existing vector index; cheap.
-2. **Seed order** — sort items by **structural degree** (information-rich first):
-   - Chunks: outgoing `:DOCUMENTS`-edge count.
-   - Observations: outgoing `:EVIDENCE_FOR`-edge count (or `:MOTIVATES` count if no facts yet).
-3. **Pick next seed** — the highest-degree unassigned item.
-4. **Greedy expand** — among the seed's KNN-10, take the highest-similarity unassigned neighbor (above a min threshold of `0.3` to avoid forcing weak matches), add to cluster, deduct from budget. Repeat until budget exhausted or no qualified neighbor remains.
-5. **Emit cluster**, mark items assigned, return to step 3 with the next-highest unassigned seed.
-6. **Singleton post-pass** — if a cluster has only one item but budget remains, try to merge it into the nearest cluster that still has budget headroom; otherwise emit as a single-item group (the interview degrades gracefully to per-item).
+1. KNN-10 over each item's vector (one query against FalkorDB's vector index).
+2. Seed order: items sorted by **structural degree** — chunks by outgoing `:DOCUMENTS`-edge count (information-rich first); observations by outgoing `:EVIDENCE_FOR`-edge count (or `:MOTIVATES` count if no facts yet).
+3. Pick next seed: the highest-degree unassigned item.
+4. Greedy expand: among the seed's KNN-10, take the highest-similarity unassigned neighbor (above min threshold of `0.3`), add to cluster, deduct from budget. Repeat until budget exhausted or no qualified neighbor remains.
+5. Emit cluster, mark items assigned, return to step 3.
+6. Singleton post-pass: if a cluster has only one item but budget remains, try to merge into the nearest cluster with budget headroom; otherwise emit as a single-item group.
 
-**Edge cases**:
-- *Tiny graph* (< 5 items): all items in one group, skip clustering.
-- *Disconnected graph* (no qualified neighbors anywhere — graph just embedded, no edges yet): each item becomes its own group; the interview degrades to per-item, which is the worst case but still functional.
-- *Hot-spot* (one item has many strong KNN matches): greedy gives it the cluster it deserves, then moves on; no backtracking.
+**Why not k-means / HDBSCAN / Louvain?** k-means needs `k` upfront (size is driven by budget, not `k`); HDBSCAN finds natural density clusters but ignores budget; Louvain produces good global structure but needs post-processing for size and brings a dependency. Greedy KNN-walk: simple, deterministic, no library, swappable later.
 
-**Why this and not k-means / HDBSCAN / Louvain?**
-- *k-means* needs `k` upfront; the natural size is driven by budget, not by `k`.
-- *DBSCAN / HDBSCAN* are nice for finding natural density clusters but don't respect the budget constraint.
-- *Louvain / Leiden* produce good global structure (modularity-optimal) but need post-processing to enforce size and bring an external dependency.
-- *Greedy KNN-walk*: simple to implement in-package, naturally respects budget, deterministic given seed order, can be swapped for a smarter algorithm later without changing the API.
-
-**Recomputation**: clusters are ephemeral. Built fresh per interview round, never stored. The same chunk may land in different clusters on different runs depending on which items are already verified — that's fine, clusters are scaffolding for the interview, not knowledge in their own right. Cost is `O(N × 10)` similarity lookups per round, cheap up to ~10K items.
+**Recomputation**: clusters are ephemeral, built per round, never stored. Cost is `O(N × 10)` per round.
 
 **Tunables** (exposed as flags / MCP args):
-- `--budget-chars` (default 24000, ≈ 6 KB tokens at the chunker's typical density)
-- `--min-similarity` (default 0.3 — below this, neighbors aren't pulled in even if budget allows)
-- `--seed-by` (default `degree`; alternatives: `random` for variation between runs, `created_at` for chronological coverage)
+- `--budget-chars` (default 24000, ≈ 6 KB tokens)
+- `--min-similarity` (default 0.3 for chunks, 0.4 for observations — tighter for cleaner facts)
+- `--seed-by` (default `degree`; alternatives: `random`, `created_at`)
 
-### Group size
-
-The constraint is the agent's context window. A group of chunks plus the agent's reply (the observations) plus any system prompts must fit. Targeting:
-
-- **Per group: 2–5 chunks**, totalling roughly 4,000–6,000 tokens of chunk content.
-- **At one extreme**, very dense chunks (long technical docs) → 2 chunks per group.
-- **At the other**, short FAQ-style chunks → 5 per group.
-
-The interview orchestrator computes group sizes by accumulating chunk char counts into a budget of ~24 KB per group (≈ 6 KB tokens), then forms groups via greedy KNN-walk: start with seed chunk, add KNN neighbors until budget exceeded, emit group, repeat.
-
-### How many observations per group
-
-Function of chunk content density. The orchestrator suggests a *target* and lets the agent decide:
-
-```
-target_observations = round(total_group_chars / 1200)
-```
-
-So a group of 5 × 1500-char chunks (= 7500 chars) → suggest ~6 observations. The agent may produce fewer (group is sparse) or more (group is dense). A floor of 1 and a ceiling of `2 × target` keeps it bounded. The example you raised — 5 chunks → ~20 observations — corresponds to dense chunks (~1200 chars per observation × 20 = 24 KB of source content), which fits at the upper end of the budget.
-
-### Granularity tunable
-
-The observations-per-chunk ratio is exposed as a setting (0=terse, 5=balanced, 10=verbose). Default 5. Higher granularity means smaller observations (each more focused), lower means broader observations (each spanning more material). The orchestrator scales the `target_observations` formula by `granularity / 5`.
-
-### What an observation looks like
-
-A single sentence (rarely two), high signal-to-noise, anchored to one or more chunks via `:MOTIVATES`. Examples:
-
-- "The doc-to-code linker excludes `:File` from `:DOCUMENTS` targets because file-level mentions are too broad to be useful." (motivates 1 chunk)
-- "All MCP tools follow the same handler signature `func(ctx, req, Input) (*Result, any, error)` from the modelcontextprotocol/go-sdk." (motivates 2 chunks: one in cmd/ingest/main.go-related doc, one in ARCHITECTURE.md)
-
-The interview is best run **after all docs have been ingested** so the KNN clusters are well-formed. Running it incrementally (per-file as docs land) loses the global perspective the grouping is designed to capture.
-
----
-
-## 5. Observation creation phase: user-in-the-loop via MCP
-
-The interview generates *proposed* observations. They don't enter the graph until the user confirms. This is enforced via the MCP **elicitation** mechanism (the spec's standard way for a server to request human input through the client).
-
-### Tool flow per group
+#### Tool flow for the bootstrap interview
 
 ```
 propose_observations(repo, chunk_ids[], granularity?)
   → returns { session_id, proposed: [ {text, motivates_chunk_ids[]} ] }
+
+confirm_observations(session_id, accepted: [...], rejected_indexes: [...])
+  → returns { observation_ids[], motivates_edges_created }
 ```
 
-The MCP server runs the LLM call internally (via sampling, in clients that support it) or formulates a prompt for the agent to execute and pass back. Either way, it returns the proposed observations to the client.
-
-The client **renders the proposals to the user** (this is the surface the agent doesn't get to bypass). User options per item:
-- **Accept as-is**
-- **Edit** the text or change which chunks it motivates
-- **Reject**
-- **Add freeform note** (becomes a new observation in the same batch)
-
-### Confirmation submit
-
-```
-confirm_observations(session_id, accepted: [ {text, motivates_chunk_ids[]} ], rejected_indexes: [...])
-  → returns { observation_ids: [...], motivates_edges_created: int }
-```
-
-Server side:
-- For each accepted observation: `AddObservation(text)` → `LinkObservationMotivatesChunk(obs_id, chunk_id)` for each motivated chunk
-- Returns the new IDs so the agent can refer to them in subsequent calls
-
-This is `batch_observations` in disguise — the batch is exactly the user-confirmed set from one interview round.
-
-### Loop until exhaustion
-
-The interview iterates: present a group, get confirmed observations, present the next group, etc. The orchestrator skips groups whose chunks are *already* well-covered (`last_distilled_at` recent) so re-runs don't duplicate effort.
-
-### Session lifecycle
-
-`session_id` is in-memory state in the ingest server, TTL ~10 minutes. If the user takes longer to review, the session expires and a fresh `propose_observations` call is needed (the orchestrator can resume from the chunk where it left off via `last_distilled_at`).
-
-### What this gives us
-
-By the end of the observation phase, every chunk that the agent + user thought worth covering has 1–N observations motivating it. Chunks that *no* observation motivated remain `:MOTIVATES`-incoming-empty — flagged as unverified material (the rule from `ARCHITECTURE.md`: a chunk without observations is unverified content).
-
----
-
-## 6. Opt-in: "generate facts from these observations?"
-
-Before fact generation begins, the user is asked. This gate exists for two reasons:
-- Fact generation is a deeper LLM commitment (more groups, more triplets, more review work).
-- The user may want to stop at observations only — observations alone are useful for embedding-based recall and don't require the structural overhead of facts.
-
-```
-prompt_fact_generation(repo)
-  → elicits {generate: bool, reason?}
-```
-
-If the user declines, the lifecycle parks at the observation layer. Re-prompted next time they explicitly invoke a fact-generation flow. If they accept, the orchestrator proceeds to Section 7.
-
-The framing of the prompt matters: "Generate facts from these observations? This enables the inference engine and contradiction detection." Sets the right expectations — facts unlock logical reasoning the embedding layer can't do.
-
----
-
-## 7. Fact generation flow
-
-Same multi-turn pattern as observations, one layer up.
-
-### Clustering observations
-
-Same algorithm as §4 ("Cluster identification") with observation-specific signals: structural bonus is `+0.3` for shared `:MOTIVATES` target chunks, `+0.2` for chunks in the same source file. Each cluster represents a *theme* — observations that together describe one aspect of the system.
-
-- Per cluster: 5–15 observations (smaller than chunk groups since observations are denser per byte). The `--budget-chars` default still applies; observations just pack more per byte.
-- The min-similarity threshold becomes more important here: loose clusters yield noisy facts. Tighten to `0.4` if the LLM's proposed facts come back unfocused.
-
-### Per-cluster proposal
+For facts:
 
 ```
 propose_facts(repo, observation_ids[], target_count?)
-  → returns {
-      session_id,
-      proposed: [
-        { subject, predicate, object, evidence_obs_ids[] }
-      ]
-    }
-```
+  → returns { session_id, proposed: [ {subject, predicate, object, evidence_obs_ids[]} ] }
 
-The LLM is given:
-- The observation contents in the cluster
-- The kernel predicates list (`is_a`, `subtype_of`, `part_of`, `equivalent_to`, `incompatible_with`, `causes`, `requires`)
-- A note that open-set predicates are allowed but inert to the inference engine
-
-The LLM proposes triplets that compress the cluster's content. Each proposed fact carries `evidence_obs_ids` — which observations in the cluster back it (enforces no-orphan-facts upstream).
-
-### User confirmation
-
-Same MCP elicitation pattern as observations. Per-fact:
-- Accept
-- Edit subject/predicate/object
-- Reject
-- Re-attribute evidence (change which observations back this fact)
-
-### Submit
-
-```
 confirm_facts(session_id, accepted: [...], rejected_indexes: [...])
-  → returns { fact_ids: [...], evidence_edges_created: int }
+  → returns { fact_ids[], evidence_edges_created }
 ```
 
-Server side: `CreateFactFromObservation` for each accepted fact, with the listed `evidence_obs_ids` linked via `:EVIDENCE_FOR`.
+`evidence_obs_ids` on each proposed fact enforces Invariant 1 upstream — a fact can't be confirmed without an observation backing it.
 
-### Loop
+Sessions are in-memory in the ingest server, TTL ~10 minutes. Expired sessions are restarted from `last_distilled_at` markers on chunks/observations, so progress isn't lost.
 
-Repeat for each cluster until all observations have been considered. Observations that didn't fit any proposed fact remain unattached on the fact layer (which is fine — they may be too specific, too unique, or rejected by the user).
+#### Group sizing for the interview
 
-### What this gives us
-
-By the end of fact generation, the memory graph has a structured **conceptual layer** (facts) connected to a **perceptual layer** (observations and chunks) via well-defined edges. The graph is now ready for inference.
+- Per group: 2–5 chunks, totalling roughly 4–6 KB tokens.
+- Target observations per group: `round(total_group_chars / 1200)`, scaled by `granularity / 5` (default granularity 5; range 0–10).
+- A group of 5 × 1500-char chunks → ~6 observations at default granularity, ~12 at granularity 10.
 
 ---
 
-## 8. Inference engine first pass: `dlpfc`
+## Verification (scoped)
 
-Once facts exist, the inference engine (provisionally named `dlpfc` after the dorsolateral prefrontal cortex — classical deductive reasoning) runs a verification pass to check the ontology's consistency against the underlying code.
+Per Invariant 4, verification is decomposed into separate scopes with separate signals. Each scope answers a different question.
 
-Five complementary strategies, each surfacing a different class of issue:
+### Scope: Logical verification
 
-### Strategy A: Reverse anchoring
+Question: do facts contradict each other?
 
-For each fact, walk evidence backward to ground:
-
-```
-:Fact → :EVIDENCE_FOR ← :Observation → :MOTIVATES → :Chunk → :DOCUMENTS → :CodeEntity
-```
-
-If the fact mentions a subject/object that maps to a `:CodeEntity` name, check the entity exists. If a fact says `(EventViewImpl, is_a, Class)` but no `:Class {name:'EventViewImpl'}` exists in the code graph, surface as **stale-fact**. Likely a renamed or removed entity.
-
-### Strategy B: Triplet validation against code structure
-
-For triplets where both subject and object map to known code entities, check the relationship in the code graph. Mappings:
-
-| Triplet | Code-graph check |
-|---|---|
-| `(X, subtype_of, Y)` where X, Y are classes | `MATCH (X)-[:EXTENDS]->(Y)` |
-| `(X, subtype_of, Y)` where Y is interface | `MATCH (X)-[:IMPLEMENTS]->(Y)` |
-| `(X, part_of, Y)` where X is method, Y is class | `MATCH (Y)-[:DEFINES]->(X)` |
-| `(X, requires, Y)` where both are functions | `MATCH (X)-[:CALLS]->(Y)` (transitive over k hops) |
-
-Mismatch surfaced as **claim-without-structural-backing**. Either the code changed (fact stale) or the fact was wrong (re-verify).
-
-### Strategy C: Forward chaining over axiom edges
-
-Apply the reserved axiom edges (`:ENTAILS`, `:INSTANCE_OF`, `:SUBTYPE_OF`, `:Rule` reification) to derive new facts. Example:
-
-- Existing facts: `(Method, subtype_of, CodeEntity)` and `(getPullRequest, is_a, Method)`
-- Derivable: `(getPullRequest, is_a, CodeEntity)`
-
-Surface derivations as **candidate facts** for the user to ratify. Doesn't auto-write — keeps the no-orphan-facts invariant (a derived fact has no observation backing it; promoting requires the user to confirm and the engine generates a synthetic observation citing the derivation).
-
-### Strategy D: Contradiction scan
-
-For predicates with functional semantics (each subject has at most one object), look for siblings that conflict:
+For predicates with functional semantics (`is_a`, `equivalent_to`), look for siblings that conflict:
 
 ```cypher
 MATCH (f1:Fact {subject:$s, predicate:'is_a'})
@@ -340,356 +449,206 @@ WHERE f1.object <> f2.object
 RETURN f1, f2
 ```
 
-Same for `equivalent_to` (transitive symmetric — partition violation) and pairs related via `incompatible_with` (X incompatible_with Y, but a fact also asserts X requires Y).
+For `incompatible_with` pairs: also check that no other fact asserts `requires` or `causes` between the same subjects.
 
-Surface as **contradiction**. Rule from `ARCHITECTURE.md`: contradictions get *resolved immediately*, not stored — the engine surfaces them; the user decides which fact stands.
+Per the "no stored contradictions" rule, surfaced contradictions are *resolved immediately* by the agent + user, not persisted as edges.
 
-### Strategy E: Coverage-gap detection
+### Scope: Structural verification
+
+Question: do facts that mention code entities match the code graph?
+
+For triplets where both subject and object map to known entities:
+
+| Triplet | Code-graph check |
+|---|---|
+| `(X, subtype_of, Y)` where both classes | `(X)-[:EXTENDS]->(Y)` exists |
+| `(X, subtype_of, Y)` where Y is interface | `(X)-[:IMPLEMENTS]->(Y)` exists |
+| `(X, part_of, Y)` where X method, Y class | `(Y)-[:DEFINES]->(X)` exists |
+| `(X, requires, Y)` both functions | `(X)-[:CALLS*1..k]->(Y)` exists (transitive) |
+
+Mismatch: claim-without-structural-backing — either the code changed (fact stale) or the fact was wrong.
+
+### Scope: Evidence verification
+
+Question: does the evidence supporting a fact actually support it?
+
+For each `:Fact`, walk its incoming `:EVIDENCE_FOR` edges to observations, walk those observations' outgoing `:MOTIVATES` to chunks. Check:
+- Do the observation contents semantically support the fact's triplet? (LLM check, can be batched)
+- Do the chunks the observations are grounded in still exist?
+- Are the chunks' contents still consistent with the observations? (`content_hash` comparison + LLM check on drift)
+
+A fact whose evidence has decayed gets flagged for re-verification, not auto-pruned.
+
+### Scope: Anchor verification
+
+Question: do anchors still point to the right things?
+
+- `:Observation`-`:MOTIVATES`-`:Chunk`: does the observation still describe the chunk's current content?
+- `:Chunk`-`:DOCUMENTS`-`:CodeEntity`: was the link a name collision? Was it a meaningful description that now points at unrelated code?
+- `:CodeEntity` rename detection: does an entity's `signature_hash` match a recently-deleted entity's hash? → propose rename.
+
+Confidence-scored. Below threshold queues for review.
+
+### Scope: Coverage verification
+
+Question: what important parts of the system lack documentation, observations, or facts?
 
 Surface absences:
-
-- `:CodeEntity` nodes with no `:DOCUMENTS` incoming → undocumented code
-- `:Chunk` with no `:MOTIVATES` incoming → unverified docs (per the rule)
-- `:Observation` with no `:EVIDENCE_FOR` outgoing → episodic-only, may be pruning candidate
+- High-centrality `:CodeEntity` (many incoming `:CALLS`) with no `:DOCUMENTS` → undocumented hot spot
+- `:Chunk` with no `:MOTIVATES` → unverified docs
+- `:Observation` > 30 days old with no `:EVIDENCE_FOR` → episodic-only (prune candidate)
 - `:Fact` whose subject doesn't appear in any backing observation's text → spurious fact
 
-These aren't logical errors but health signals. Drive maintenance queues.
+These are health signals, not errors. They drive `hygiene_queue`.
 
-### Output format
+### Practical near-term checks (vs. forward chaining)
 
-The first pass returns a structured report:
+Forward chaining inference (the `dlpfc` deep reasoning) is **deferred** until the graph has sufficient quality and density. Near-term, the practical verification surface is:
 
 ```
-{
-  "stale_facts": [...],        // strategy A
-  "unsupported_claims": [...], // strategy B
-  "candidate_derivations": [...], // strategy C
-  "contradictions": [...],     // strategy D
-  "coverage_gaps": {...}       // strategy E
-}
+verify_changed_entity(entity_id) → report                  // Moment 5 trigger
+verify_docs_for_changed_entity(entity_id) → stale_chunks   // Moment 5
+verify_observation_anchors(observation_ids?) → drift_report // anchor scope
+verify_fact_against_code(fact_ids?) → mismatches            // structural scope
+verify_coverage(repo, signal_kinds?) → gaps                 // coverage scope
 ```
 
-The agent walks each section with the user, applying corrections via the same `confirm_facts` flow (accept candidates, retract stale facts, resolve contradictions).
+These five cover Tier 2 and most of Tier 3. Forward chaining (`:ENTAILS` / `:Rule` reification) lands later when there's enough fact density to make derivations meaningful.
 
 ---
 
-## 9. Online lifecycle
-
-The phases above (1–8) are the **bootstrap**. Online lifecycle is what happens during normal agent work, when an agent is solving a task and mesial is in the loop.
-
-This is the largest section and the most consequential — most of mesial's value comes from being a constant background utility, not a one-time setup pass.
-
-### 9.1 Conceptual frame
-
-Three modes of mesial usage during work:
-
-- **Semantic mode** — vector search over chunks/observations to find relevant material. "What does the codebase say about X?"
-- **Logical mode** — structural queries over the code graph + inference over facts. "What are the consequences of changing X?"
-- **Combined mode** — semantic to find candidates, logical to validate or expand. "Find code likely related to X, then check whether changing it would break invariants."
-
-The interesting questions are mostly *combined*. Semantic alone is grep-with-vibes; logical alone is grep-with-structure. The combination is what justifies the architecture.
-
-### 9.2 Scenarios
-
-Brainstormed exhaustively, organized by category. Each scenario names: what triggers it, what mesial does, what the agent does with the result.
-
-#### A. Reactive context loading
-
-**A1. Task initiation**
-- *Trigger*: agent receives task ("fix the auth bug")
-- *Mesial*: vector search the task description over chunks → top-K → traverse `:DOCUMENTS` to entities → traverse `:MOTIVATES` to relevant observations → traverse `:EVIDENCE_FOR` to relevant facts
-- *Agent gets*: a focused subgraph (chunks + entities + observations + facts) loaded as initial context, replacing 80% of the "where do I start?" exploration
-
-**A2. Reading a new file**
-- *Trigger*: agent opens file F that it hasn't seen this session
-- *Mesial*: lookup `:File {path: F}` → traverse `:DEFINES` to entities → traverse `:CALLS`/`:EXTENDS`/`:IMPLEMENTS` to neighbors → for each entity, find documenting chunks + their observations
-- *Agent gets*: structured tour: "this file defines X (extends Y, called by Z); X is documented in chunk Q which says ..."
-
-**A3. Following a stack trace**
-- *Trigger*: error message mentions function F
-- *Mesial*: `:Function {name: F}` → traverse incoming `:CALLS` (callers) and `:DOCUMENTS` (descriptions) → observations about F
-- *Agent gets*: caller context + documented behavior + episodic notes (e.g., "X has been observed to fail under condition Y")
-
-#### B. Authoring assistance
-
-**B1. Convention checking before writing**
-- *Trigger*: agent about to add a new function/method/class
-- *Mesial*: vector search proposed name + signature over existing code-related observations and facts
-- *Agent gets*: similar prior code, conventions, naming patterns
-- *Combined-mode*: facts like `(Service classes, requires, dependency injection via constructor)` surfaced if relevant
-
-**B2. Refactoring blast radius**
-- *Trigger*: agent considering changing function/class signature, removing entity, etc.
-- *Mesial*: from target entity, traverse outward:
-  - Incoming `:CALLS` → callers (must update)
-  - `:DOCUMENTS` → chunks documenting it (must update if behavior changes)
-  - `:EVIDENCE_FOR` → observations mentioning it (need re-verification)
-  - `:Fact` triplets where subject or object equals target → facts that may invalidate
-- *Agent gets*: a checklist of impact sites stratified by type
-- *Logical extension*: dlpfc runs strategy B (triplet validation) post-change to flag broken claims
-
-**B3. Hypothesized change validation**
-- *Trigger*: agent: "what if EventViewImpl implemented Cache instead of Storage?"
-- *Mesial (semantic)*: search docs for prose mentioning EventViewImpl + Storage relationship
-- *Mesial (logical via dlpfc)*: facts about EventViewImpl — derive consequences via forward chaining; check if change implies contradictions
-- *Agent gets*: combined report — docs to update + logical inconsistencies surfaced
-
-**B4. Similar-code lookup**
-- *Trigger*: agent has a problem to solve, suspects a similar pattern exists
-- *Mesial*: vector search problem description over docs + observations → DOCUMENTS targets in code → "have we done this before?"
-- *Agent gets*: pointers to existing implementations + observations about how they work
-
-#### C. Investigation & debugging
-
-**C1. Bug investigation**
-- *Trigger*: bug report or test failure
-- *Mesial (semantic)*: search bug description over observations → past episodic notes about similar issues
-- *Mesial (logical)*: facts about invariants of the involved functions — does any fact say "X never returns null"? If so, the invariant has been broken (or was wrong)
-- *Agent gets*: prior occurrences + claimed invariants to test
-
-**C2. Performance investigation**
-- *Trigger*: "this endpoint is slow"
-- *Mesial (semantic)*: past observations about performance issues
-- *Mesial (logical)*: walk `:CALLS` chain from the endpoint → for each function in the chain, check facts about its performance characteristics
-- *Agent gets*: prioritized list of investigation candidates with prior knowledge attached
-
-**C3. Decision archaeology**
-- *Trigger*: "why was X done this way?"
-- *Mesial*: semantic search across observations → episodic facts about the decision
-- *Agent gets*: surfaced rationales from past sessions, instead of guessing
-
-#### D. Review & quality
-
-**D1. PR review**
-- *Trigger*: agent reviewing a diff
-- *Mesial*: for each changed entity, find documenting chunks → check if docs match new behavior
-- *Mesial (logical)*: for each new function, propose facts and check against existing facts (surface incoming changes that contradict invariants)
-- *Agent gets*: review comments grounded in known context, not just style
-
-**D2. Architecture compliance**
-- *Trigger*: rule encoded as fact, e.g. `(data layer, incompatible_with, UI component imports)`
-- *Mesial (logical via dlpfc)*: scan PR for new edges that violate the constraint
-- *Agent gets*: explicit violation report — "this PR adds an import from data → UI which is forbidden"
-
-**D3. API surface stability**
-- *Trigger*: PR changes a function signature
-- *Mesial*: lookup facts about the function — `(X, is_a, public API)`, `(X, is_a, stable interface)`
-- *Mesial (logical)*: contradiction surfaced — changing a stable interface
-- *Agent gets*: backward-compatibility flag at review time
-
-**D4. Test discovery**
-- *Trigger*: agent making changes to function F
-- *Mesial*: incoming `:CALLS` to F where the file path matches `/test/` → tests exercising F
-- *Agent gets*: focused test list (run/update these)
-
-#### E. Documentation flow
-
-**E1. Documentation generation**
-- *Trigger*: "document function F"
-- *Mesial*: find related entities via `:CALLS`/`:DOCUMENTS` → existing chunks for style examples → facts about F to include in the doc
-- *Agent gets*: structured starting point for the doc, not a blank page
+## Substrate construction (the bootstrap chronology)
 
-**E2. Stale doc detection**
-- *Trigger*: scheduled or post-merge
-- *Mesial*: chunks documenting code entities that have changed (compare `:DOCUMENTS`-targets' `src_start`/`src_end` against current source) → mark for review
-- *Agent gets*: list of doc sections to refresh
+The deterministic ingestion that underlies everything above. Order matters: tree-sitter, LSP, docs, linker, then observation/fact layers can be populated.
 
-**E3. Migration planning**
-- *Trigger*: "we're moving from library A to library B"
-- *Mesial (semantic)*: search "library A" usage over chunks
-- *Mesial (logical)*: code entities that import/use A's APIs; facts about A's behavior to port to B
-- *Agent gets*: structured migration list with priorities
+### 1. Initialization
 
-#### F. Memory hygiene (background / scheduled)
+The point at which mesial knows *of* a repository but not yet anything about it.
 
-**F1. Embedding refresh on doc change**
-- *Trigger*: file change watcher detects `.md` edit
-- *Mesial*: re-chunk → re-embed only changed chunks → keep existing chunk IDs where boundary unchanged, drop+recreate where changed
-- *Side effect*: `:MOTIVATES` edges to dropped chunks are gone — affected observations need re-linking
+#### Empty repository
 
-**F2. Embedding model upgrade**
-- *Trigger*: switching to a new embedding model
-- *Mesial*: full background re-embed; may need vector index rebuild if dimension changes
-- *Strategy*: do per-graph, in batches; keep old index live until new one is fully populated, then atomic swap
+```
+h9s-cli memory init --repo {name}
+```
 
-**F3. Observation aging**
-- *Schedule*: periodic
-- *Mesial*: `MATCH (o:Observation) WHERE NOT (o)-[:EVIDENCE_FOR]->() AND o.created_at < timestamp() - N` → prune candidates
-- *Agent action*: review and confirm prune
+Writes the singleton `:GraphMeta`:
 
-**F4. Fact verification staleness**
-- *Schedule*: periodic
-- *Mesial*: `MATCH (f:Fact) WHERE f.last_verified_at < timestamp() - N` → re-verification queue
-- *Agent action*: re-validate against current code via dlpfc strategy B
+```
+:GraphMeta {
+  kind,                      // "code" | "notes" | "memory"
+  strict,                    // default false
+  schema_version,            // current schema version (for migrations)
+  embedding_model_version    // identifier for the embedding model used (e.g., "qwen3-0.6b-q8")
+}
+```
 
-**F5. Conflict surfacing**
-- *Schedule*: post-fact-creation, periodic
-- *Mesial*: dlpfc strategy D scans for contradictions
-- *Agent action*: resolve at runtime, never store the conflict
+`schema_version` and `embedding_model_version` are essential for future migrations and reproducibility — checking either of these against current values surfaces graphs that need re-embedding or schema migration.
 
-#### G. Knowledge accumulation (during work)
+Also creates the indexes the corresponding kind needs.
 
-**G1. Runtime observation capture**
-- *Trigger*: agent notices something during work ("function X silently truncates inputs > 1024")
-- *Mesial*: agent calls `add_observation` (single, no group context) → KNN against existing observations → surfaces neighbors and any related facts
-- *Agent gets*: chance to refine the observation before commit; user-in-the-loop confirms
+#### Implicit initialization
 
-**G2. Cross-task transfer**
-- *Trigger*: task B touches code that task A previously made observations about
-- *Mesial*: A's observations are persisted in the repo's memory; A2-style context loading surfaces them automatically when B reads the file
-- *Result*: don't repeat past mistakes (the canonical example: "remember that X is fragile under Y conditions")
+For typical onboarding, `analyze_repository` and `ingest_documents` create the graph on first write. Explicit `memory init` is only needed for the global `memory` graph, asserting kind upfront, or re-affirming `strict`.
 
-**G3. Self-monitoring**
-- *Trigger*: mesial keeps observations about itself (the user prefers MOTIVATES over GROUNDED_IN, etc.)
-- *Mesial*: observations in the global `memory` graph apply to mesial's own development
-- *Result*: meta-loop where mesial improves its own use over time
+### 2. Onboarding from existing repos
 
-#### H. Onboarding & explanation
+```
+h9s-cli analyze --path /path/to/repo
+```
 
-**H1. Architecture explanation**
-- *Trigger*: "how does the auth flow work?"
-- *Mesial (semantic)*: search "auth flow" over chunks
-- *Mesial (logical)*: traverse `:CALLS` from entry point to build a flow
-- *Mesial (logical)*: facts about auth (`AuthService is_a SecurityComponent`, `Login requires AuthService`) for relationship summary
-- *Agent gets*: structured walk-through, not a file listing
+Four passes:
 
-**H2. New contributor onboarding**
-- *Trigger*: someone new asking high-level questions
-- *Combined*: semantic for prose, logical for structure, facts for invariants
-- *Agent assembles* a tailored intro from the graph
+1. **Tree-sitter** — `:File`, `:Class`, `:Function`, `:Method`, `:Constructor`, `:Interface`, `:Enum` + `:DEFINES` edges.
+2. **LSP** — `:CALLS`, `:EXTENDS`, `:IMPLEMENTS`, `:RETURNS`, `:PARAMETERS`.
+3. **Doc ingestion** — markdown chunked by heading boundary, embedded, `:Chunk` + `:OF_FILE`.
+4. **Doc-to-code linker** — `:DOCUMENTS` edges via identifier-mention scan.
 
-#### I. Specialized analyses
+After this completes, the graph has its **perceptual + structural** state. Observations and facts are added through the population strategies above.
 
-**I1. Security audit**
-- *Trigger*: scheduled audit or specific concern
-- *Mesial*: search observations/facts mentioning auth, crypto, input validation → cross-reference with code touching these areas
-- *Logical*: facts about security invariants — verify against current code
+#### Re-onboarding caveats
 
-**I2. Feature flag mapping**
-- *Trigger*: planning to remove flag F
-- *Mesial*: facts and observations referencing F → cleanup checklist
+Idempotent but with the chunk-churn risk that motivated [anchor stability](#anchor-stability-and-re-anchoring). Until that work lands, observations should re-link to chunks after a doc edit; with `reanchor` in place, this becomes automatic.
 
-**I3. Dead-code detection**
-- *Trigger*: cleanup pass
-- *Mesial*: code entities with no incoming `:CALLS` AND no incoming `:DOCUMENTS` → likely dead
-- *Logical extension*: check facts mentioning the entity — facts about it suggest it's still relevant; lack of facts is corroborating evidence for "dead"
+### 3. Ingestion mechanics
 
-### 9.3 Patterns and regularities
+Mechanical, deterministic. Already implemented:
 
-Across the scenarios, six patterns recur:
+| Asset | Pipeline | Output |
+|---|---|---|
+| TypeScript files | tree-sitter + LSP | `:File`, code entities, structural edges |
+| Markdown files | heading chunker + Qwen3 embedder | `:Chunk` (vector or `oversized=true`) + `:OF_FILE` |
+| Identifier mentions | `internal/doclinker` regex scanner | `:DOCUMENTS` edges |
 
-#### Pattern 1: Semantic-then-traverse (the workhorse)
+### Ingestion report (new)
 
-`vector search → graph traversal → context assembly`
+Each ingestion run emits a **health report** so it's clear whether the result is usable, not just whether the run completed:
 
-Used in: A1, A2, A3, B1, B4, C1, C2, C3, D1, E1, E3, H1, H2.
+```json
+{
+  "files_processed": 0,
+  "entities_count": 0,
+  "calls_edges_count": 0,
+  "chunks_count": 0,
+  "oversized_chunks_count": 0,
+  "documents_edges_count": 0,
+  "documented_entity_ratio": 0.0,
+  "chunks_with_documents_edges_ratio": 0.0,
+  "ambiguous_DOCUMENTS_edges": 0,
+  "unlinked_chunks_count": 0
+}
+```
 
-Almost every reactive operation starts with vector search to identify candidates, then traverses graph edges to build out the relevant subgraph. This is the **spatial navigation** promise of mesial — agents don't grep, they walk.
+Same report shape feeds into the [health metrics](#health-metrics) the maintenance loop watches.
 
-#### Pattern 2: Triplet-against-code (the bridge)
+---
 
-`fact triplet → resolve subject/object to code entities → check relation in code graph`
+## Health metrics
 
-Used in: B2, B3, C1, D2, D3, I1.
+Per Invariant 5 (repair as first-class), the system's health is measurable. Metrics are emitted during ingestion (`analyze_repository`), maintenance jobs (`hygiene_queue` runs), and on-demand (`mesial health --repo X`).
 
-The bridge between semantic and logical. Facts make claims about the world; code is ground truth. Mismatch is the engine's signal.
+| Metric | What it measures | When emitted | Read by |
+|---|---|---|---|
+| `documented_entity_ratio` | fraction of `:CodeEntity` with ≥1 `:DOCUMENTS` incoming | ingestion + on-demand | coverage queue, `surface` confidence |
+| `chunk_anchor_stability_rate` | fraction of `:Chunk` whose `content_hash` matched after re-ingest | ingestion (re-runs only) | `reanchor` decisions |
+| `observations_reanchored_confidently` | count of observations re-anchored with high confidence after last `reanchor` | post-`reanchor` | maintenance dashboard |
+| `facts_with_valid_evidence` | count of `:Fact` where evidence verification passed | `verify_evidence` runs | trust signal for `verify` reports |
+| `facts_verified_recently` | count of `:Fact` with `last_verified_at` within N days | scheduled | staleness queue size |
+| `chunks_without_observations` | count of `:Chunk` with no incoming `:MOTIVATES` | scheduled / on-demand | coverage queue |
+| `entities_without_docs` | count of `:CodeEntity` with no incoming `:DOCUMENTS` | scheduled / on-demand | coverage queue |
+| `ambiguous_DOCUMENTS_edges` | count of chunks with `:DOCUMENTS` edges to multiple entities sharing the same name | linker pass | accuracy signal for `surface` |
+| `stale_doc_candidates` | count of `:Chunk` whose `:DOCUMENTS` target's source has changed since `last_distilled_at` | scheduled / on-merge | hygiene queue, Moment 5 |
 
-#### Pattern 3: KNN-then-cluster-then-confirm (the human-in-loop primitive)
+Aggregated as a single JSON document; trends watched over time. Without these, "is mesial working?" devolves into vibes.
 
-`group similar items → present to user → batch commit confirmed`
+---
 
-Used in: Sections 4–7 (interview, fact gen), G1 (runtime obs).
+## Evaluation hook
 
-Whenever the LLM is generating durable state, this pattern surfaces it for review before commit. The most reusable interaction primitive.
+Lightweight fixtures, not a research benchmark. Just enough to prevent vibes-driven iteration when tuning similarity, structural boosts, or re-anchoring confidence.
 
-#### Pattern 4: Edge-traversal-as-impact (the change-analysis primitive)
+A `mesial/eval/` directory (or equivalent) carries:
 
-`from changed entity → traverse incoming edges → enumerate dependents`
+```
+golden_surface_queries/
+  <task_prompt>.expected.json   // expected chunk_ids, entity_ids, observation_ids returned by surface()
+golden_impact_queries/
+  <entity_id>.expected.json     // expected dependent_set
+golden_stale_doc_cases/
+  <repo_snapshot>.expected.json // expected stale_doc_candidates after a known doc change
+golden_reanchor_cases/
+  <chunk_change>.expected.json  // expected remap with confidence
+golden_contradictions/
+  <fact_pair>.expected.json     // expected verify_logical findings
+```
 
-Used in: B2 (refactoring), D1 (PR review), D2 (compliance), D4 (test discovery), E2 (stale docs), E3 (migration), F1 (embed refresh), I3 (dead code).
+Five categories, one fixture each at minimum. CI runs them on PRs that touch:
+- The clustering algorithm
+- The similarity function
+- The linker
+- `reanchor`
+- `verify` (any scope)
 
-Almost any "what depends on X?" question reduces to this. The graph schema's edge density determines the depth of analysis available.
-
-#### Pattern 5: Time-driven maintenance queues (the hygiene primitive)
-
-`property timestamp + age threshold → review queue`
-
-Used in: F1, F3, F4 (memory hygiene), E2 (stale docs).
-
-Every node carries lifecycle timestamps; background jobs convert those into work queues. Without these, the graph rots.
-
-#### Pattern 6: Combined semantic + logical (the most powerful)
-
-`semantic to find candidates → logical to validate or expand`
-
-Used in: B3, C1, C2, D1, D3, H1, H2, I1.
-
-The combinations are where mesial earns its keep. Either alone is decent; together they're qualitatively different.
-
-### 9.4 Backbone design patterns
-
-The patterns above suggest five **backbone** primitives — interfaces the rest of the system composes from:
-
-#### 1. `surface(query, depth) → context_subgraph`
-The semantic-then-traverse implementation. Inputs: free-text query, traversal depth (chunks only, +entities, +facts). Output: a slice of the graph as a JSON object the agent can consume directly. **Used by**: every reactive load. **Implements**: Pattern 1.
-
-#### 2. `propose_then_confirm(items, action_kind) → committed_ids`
-Generic multi-turn confirm flow. Wraps MCP elicitation. **Used by**: observation interview, fact generation, runtime obs capture, conflict resolution. **Implements**: Pattern 3.
-
-#### 3. `impact(entity, kinds) → dependent_set`
-Edge-traversal walker, parameterized by which edge types to follow. **Used by**: refactoring, PR review, compliance, dead-code, test discovery. **Implements**: Pattern 4.
-
-#### 4. `verify(fact_ids, strategies) → report`
-Inference engine entry point, runs the strategies from Section 8 against a fact set. **Used by**: dlpfc passes, PR review, post-fact-creation. **Implements**: Pattern 2 + parts of 6.
-
-#### 5. `hygiene_queue(kind) → items`
-Time-and-state-driven query producer. **Used by**: F1–F5, E2. **Implements**: Pattern 5.
-
-These five primitives cover most of the scenarios. Building them well means most scenarios fall out as compositions.
-
-### 9.5 Prioritization
-
-Tier 1 — **must-have for "useful agent"** (immediate ROI, every task benefits):
-- Primitive 1 (`surface`) — Pattern 1 — enables A1, A2, A3, B1, B4, H1
-- Primitive 2 (`propose_then_confirm`) for observation creation — Sections 4–5 — enables runtime observation capture
-- The MCP tools that wrap these into a usable surface
-
-Tier 2 — **force-multipliers** (build on Tier 1's accumulated memory):
-- Primitive 3 (`impact`) — Pattern 4 — enables B2, D1, D4, E2
-- Primitive 5 (`hygiene_queue`) — Pattern 5 — keeps the system from rotting
-- Fact generation flow (Sections 6–7)
-
-Tier 3 — **advanced reasoning** (the dlpfc payoff):
-- Primitive 4 (`verify`) — Pattern 2 — Section 8 strategies
-- Combined-mode scenarios B3, C1, C2, D2, D3, I1
-
-Tier 4 — **late / specialized**:
-- E1 (doc generation), E3 (migration planning)
-- I1 (security audit), I2 (feature flag), I3 (dead code)
-- G3 (self-monitoring meta-loops)
-
-Tier 1 is a few months of work but unlocks daily-use value immediately. Tier 2 follows naturally and starts paying compound interest. Tier 3 needs the inference engine which is its own design pass. Tier 4 is opportunistic — built when a concrete need arises.
-
-### 9.6 Update strategies during online use
-
-A few cross-cutting questions raised in the request:
-
-**Q: Auto-fetch relevant info at task start?**
-Yes, via Primitive 1 — the agent skill calls `surface(task_description, depth=full)` at task initiation. Returns a subgraph the agent loads into context before doing anything else. Cost: one embedding + a few graph queries; payoff: the agent skips most exploratory grep.
-
-**Q: Update references at task end?**
-Two updates worth doing:
-- For each file the agent edited, queue stale-doc detection (E2) to find chunks documenting changed entities.
-- For observations the agent made during the task, enqueue fact-generation candidacy (Section 7 trigger) — observations cluster naturally per-task.
-
-**Q: Re-process all chunk embeddings?**
-Only on embedding-model upgrade (F2), not per task. Doc edits (F1) re-embed only the changed file's chunks. The vector index can be rebuilt incrementally — FalkorDB's CREATE VECTOR INDEX is idempotent, and existing nodes' vectors remain valid until re-embedded.
-
-**Q: Hypothesized-change consistency?**
-Scenario B3 — combined-mode. The agent calls `surface(change_description)` for the doc/code context, then `verify(facts_about_target_entity, strategies=[B,C,D])` to find structural inconsistencies. Returns a "would this break?" report.
-
-**Q: Refactoring blast radius?**
-Scenario B2 — `impact(target_entity, kinds=[CALLS, DOCUMENTS, EVIDENCE_FOR])`. Returns dependents grouped by kind. The agent knows: "8 callers (must update), 3 documenting chunks (review docs), 2 facts whose subject is this entity (re-verify)."
+Expectations drift over time as the model improves; updates require explicit fixture changes (visible in PRs, reviewable). The point is not to lock in current behavior but to make changes deliberate.
 
 ---
 
@@ -697,17 +656,29 @@ Scenario B2 — `impact(target_entity, kinds=[CALLS, DOCUMENTS, EVIDENCE_FOR])`.
 
 Mesial's lifecycle has three temporal phases, in order of increasing leverage:
 
-**Bootstrap** (Sections 1–3, mostly mechanical, mostly already implemented). A repository goes from nothing to a graph containing its full perceptual + structural state: code entities, doc chunks, identifier-mention edges. This is the table stakes — without it, nothing else works, but having it alone is just a fancy index.
+**Substrate construction** (Sections "Substrate construction" 1–3, mostly mechanical, mostly already implemented). A repository goes from nothing to a graph containing its full perceptual + structural state. This is necessary infrastructure; without it, nothing else works, but having it alone is just a fancy index. `:GraphMeta` carries `schema_version` and `embedding_model_version` for migration safety. Each ingestion emits a health report, not just a "completed" flag.
 
-**Distillation** (Sections 4–8, the LLM-in-the-loop core, the work ahead). The agent and user collaborate to interpret the bootstrapped graph: read chunks in groups → propose observations → user confirms → propose facts from observation clusters → user confirms → inference engine verifies the result against ground truth. The interview pattern (groups of chunks for global thinking, multi-turn user confirmation) is the mechanism that converts dead documentation into structured, queryable knowledge. Each step is bounded by user authorization via MCP elicitation — the human is always in the commit path, even when the LLM does the proposing.
+**Online use** (the front-loaded section). The everyday loop: agent does work, mesial provides context (read) and accumulates memory (write). Six backbone primitives (`surface`, `propose_then_confirm`, `impact`, `verify`, `hygiene_queue`, `reanchor`) compose into six **agent moments** (Task starts, File opened, Symbol edited, Unexpected behavior found, Before commit/PR, Graph drift detected). The agent skill follows a **trigger policy** that maps each moment to a primitive call — turning the lifecycle from "scenarios" into an operating manual. `surface`'s response shape is versioned for evolution from day one. Anchor stability is treated as load-bearing; `reanchor` is promoted to a backbone primitive. Diff events (CodeEntityChanged, ChunkMoved, etc.) drive maintenance event-first, scheduled second.
 
-**Online use** (Section 9, the daily-driver, the value capture). With the graph populated, the agent uses it constantly — at task start to load context, during work to check conventions and impact, after work to refresh stale references. Five backbone primitives (`surface`, `propose_then_confirm`, `impact`, `verify`, `hygiene_queue`) compose into ~25 distinct scenarios spanning reactive loading, authoring, investigation, review, documentation, hygiene, and accumulation. The most powerful scenarios are *combined*: semantic search for candidates, logical inference for validation. Tier 1 (semantic + impact + observation capture) delivers daily-use value within the first wave of MCP tools; Tiers 2–4 layer on increasingly sophisticated reasoning as the memory graph matures.
+**Memory population** happens through eight strategies, with **work-driven observation capture as the primary path** (per Invariant 3). The bootstrap interview is one strategy among many — useful for initial population on mature undocumented repos, but not the daily mode. Other strategies (PR/diff-driven extraction, test/runtime ingestion via Issue #9, commit-message ingestion, protocol mining via Issue #6, assertion extraction, query-driven memory) each populate the graph from a different angle. Every strategy passes through `propose_then_confirm` so the user is always the commit gate. Verification is **scoped** (logical, structural, evidence, anchor, coverage) — separate checks with separate signals; forward chaining is deferred until fact density justifies it.
 
-Three architectural commitments make this work:
+Five **operational invariants** govern the design:
+1. Durable claims are evidence-backed.
+2. Anchors are repairable.
+3. Online use is the primary write path.
+4. Verification is scoped.
+5. Repair is a first-class lifecycle phase.
+
+Three **architectural commitments** make the invariants enforceable:
 1. **Layer separation** — perceptual (chunks, observations, embedded) vs. conceptual (entities, facts, structurally queryable) — keeps each layer's access pattern clean and lets them compose without representational duplication.
-2. **No-orphan-facts** — facts only enter the graph via the distillation flow with at least one supporting observation — keeps the conceptual layer grounded in evidence rather than free-floating LLM assertions.
-3. **MCP elicitation everywhere LLM proposes durable state** — the user is the commit gate for observations, facts, derivations, and contradiction resolutions — keeps the system trustworthy without requiring the LLM to be infallible.
+2. **No-orphan-facts** — facts only enter the graph through distillation with at least one supporting observation — keeps the conceptual layer grounded in evidence.
+3. **MCP elicitation as the universal commit gate** — the user is the commit gate for observations, facts, derivations, contradiction resolutions, re-anchoring decisions — keeps the system trustworthy without requiring the LLM to be infallible.
 
-The MCP tool surface that follows this document — `surface`, `propose_observations`/`confirm_observations`, `propose_facts`/`confirm_facts`, `impact`, `verify`, plus the lower-level inspectors and search tools shipped in PR #5 — is the concrete API that makes the lifecycle executable. The design is cohesive: every tool in the surface is justified by at least two scenarios in Section 9, and the five backbone primitives factor most of the work cleanly.
+Three **open design issues** must land before deep memory work:
+- [Issue #6](https://github.com/mknw/mesial/issues/6) — `:Protocol` schema (procedural memory)
+- [Issue #8](https://github.com/mknw/mesial/issues/8) — Anchor stability and re-anchoring (load-bearing for everything else)
+- [Issue #9](https://github.com/mknw/mesial/issues/9) — Test and runtime trace ingestion
 
-The right next step after this document is to design the Tier 1 MCP tools (`surface` + the propose/confirm pair for observations) in detail and ship them. With those in place, the agent can both consume context and contribute observations during real work — and the loop closes.
+The right next step after this document is to design the **Tier 1 MCP tools** — `surface` (MVP shape), `add_observation` runtime capture, `impact`, and `reanchor` — and ship them. With those in place, the agent's online-use loop closes and every commit cycle becomes a memory deposit.
+
+The most leveraged near-term outcome remains: **a coding agent starts a task, gets the right context, changes code, updates the graph, and leaves the next agent smarter than it was.** Everything in this lifecycle serves that outcome.
