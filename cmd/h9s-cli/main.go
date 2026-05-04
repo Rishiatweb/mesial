@@ -9,6 +9,7 @@
 //	h9s-cli ingest  <path>... [--repo NAME] [--strict]
 //	h9s-cli search  <query>   [--k N] [--repo NAME] [--path P]
 //	h9s-cli link              [--repo NAME] [--path P] [--strict]
+//	h9s-cli memory  <sub>     manage Fact/Observation memory layer (run "memory help" for details)
 //
 // Common flags (or env vars): --falkor-addr, --embedding-url, --lsp-cmd, --graph.
 package main
@@ -49,6 +50,8 @@ func main() {
 		err = runSearch(args)
 	case "link":
 		err = runLink(args)
+	case "memory":
+		err = runMemory(args)
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 	default:
@@ -73,6 +76,9 @@ Subcommands:
   ingest  <path>...         Chunk + embed + link markdown files (per-repo)
   search  <query>           Vector search over chunks
   link                      Re-run the doc-to-code linker on an existing graph
+  memory  <sub>             Manage the Fact/Observation memory layer
+                            (init, add-obs, create-fact, link-evidence,
+                             link-motivates, search-obs, search-facts)
 
 Common flags (override defaults / env):
   --falkor-addr   FalkorDB address       (env FALKOR_ADDR,   default `+defaultFalkorAddr+`)

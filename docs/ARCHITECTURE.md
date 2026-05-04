@@ -115,6 +115,23 @@ Each repository gets one FalkorDB graph, named `filepath.Base(repoPath)`. Resolu
 
 `ingest_documents` and `link_docs` follow this strictly. `search_documents` adds a fallback to the global `H9S_GRAPH` (default `"h9s"`) when neither `repo` nor `path` is given — so cross-cutting queries against the global graph remain possible.
 
+## Graph kinds and `:GraphMeta` (planned)
+
+Mesial recognizes three graph kinds, each with its own canonical vocabulary of labels and edges:
+
+| Kind | Subject | Canonical vocabulary |
+|---|---|---|
+| `code` | A repository's code + docs | `:File`, `:Class`, `:Function`, `:Method`, `:Constructor`, `:Interface`, `:Enum`, `:Chunk` + `:DEFINES`, `:CALLS`, `:EXTENDS`, `:IMPLEMENTS`, `:RETURNS`, `:PARAMETERS`, `:OF_FILE`, `:DOCUMENTS` |
+| `notes` | A markdown vault | `:File`, `:Chunk`, `:Tag` + `:OF_FILE`, `:LINKS_TO`, `:TAGGED` |
+| `memory` | Cross-cutting facts and observations (user preferences, working style, multi-repo claims) | `:Fact`, `:Observation`, `:Protocol` + `:EVIDENCE_FOR`, `:MOTIVATES`, plus the fact-axiom edges (`:ENTAILS`, `:INSTANCE_OF`, `:SUBTYPE_OF`, `(:Rule)-[:PREMISE]->`, `(:Rule)-[:CONCLUDES]->`) |
+
+Each graph carries a singleton `(:GraphMeta {kind, strict})` node — the in-graph declaration of which vocabulary it speaks.
+
+- `kind` ∈ `code | notes | memory`. Decided at graph creation; resolved by the ingest path (a `.git` walk-up implies `code`; the planned vault ingest implies `notes`; the memory graph is opened by name).
+- `strict` (default `false`) controls how off-vocabulary writes are handled. With `strict: false`, the writer emits whatever it finds — a `code` graph may also accumulate `:Fact` nodes, a vault may also accumulate `:DOCUMENTS` edges if it happens to mention code-entity names. `strict: true` (future) would have the pipeline reject off-vocabulary writes for graphs that need a tightly enforced shape.
+
+The default of `strict: false` everywhere is deliberate. Most observations about a repo's code belong in that repo's graph (`(:Observation)-[:MOTIVATES]->(:Chunk)` plus the chunk's own `(:Chunk)-[:DOCUMENTS]->(:Class {name:'EventViewImpl'})` — same graph, queryable in one place). The `memory` graph is reserved for material that is genuinely cross-cutting or has no single subject (preferences, working style, multi-repo observations).
+
 ## Data model
 
 ### Node labels
@@ -123,7 +140,7 @@ Each repository gets one FalkorDB graph, named `filepath.Base(repoPath)`. Resolu
 |---|---|---|
 | `:File:Searchable` | `path`, `name`, `ext` | range on `(name, ext)`, fulltext on `Searchable.name` |
 | `:Class` `:Function` `:Method` `:Constructor` `:Interface` `:Enum` (each `:Searchable`) | `name`, `path`, `src_start`, `src_end`, `doc` | fulltext on `Searchable.name` |
-| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector) | vector (cosine, 512-dim) on `Chunk.vector` |
+| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector), `last_distilled_at` (ms, optional — set when at least one `:Observation` has motivated this chunk via `:MOTIVATES`) | vector (cosine, 512-dim) on `Chunk.vector` |
 
 ### Edges
 
@@ -200,6 +217,159 @@ A repository can be both code project *and* note system: TypeScript files plus a
 - **`:SIMILAR_TO {score}`** — pre-computed chunk-to-chunk vector-similarity edges, written at ingest time. Partially redundant with on-demand KNN; deferred until a concrete use case demands stored similarity.
 - **`:MENTIONS`** — fuzzy name match across notes (analogous to the doc→code linker, but with `:File.name` as the candidate set). Considered if wiki-link-only proves too sparse on poorly-linked vaults.
 - **`:Chunk`-anchored wiki-link targets** — resolving `[[note#heading]]` to a specific chunk rather than the file. Requires breadcrumb-tail matching at link time.
+
+## Memory: facts, observations, protocols (planned)
+
+A third graph kind, **`memory`**, captures what an agent has learned. Three node labels, each with a distinct epistemological role:
+
+- **`:Observation`** — a single sentence (rarely two) describing an episode or a pattern. Free-form natural language, embedded for KNN recall, written cheaply during conversation. The episodic layer.
+- **`:Fact`** — a triplet `(subject, predicate, object)`: a structured, distilled, semantic claim. Durable, slow to change, *not* embedded. The semantic layer.
+- **`:Protocol`** — procedural memory (how-to). Schema TBD, drawing inspiration from PROV-O+P-PLAN, LinkML, and BPMN. Reserved label; design deferred.
+
+The node label *is* the kind — no `kind` enum on any of them.
+
+### Layer separation
+
+Mesial separates a *perceptual* layer (literal text, vector-indexed) from a *conceptual* layer (structured claims, structurally queryable):
+
+| Layer | Nodes | Access mode |
+|---|---|---|
+| **Perceptual** | `:Chunk`, `:Observation` | Vector KNN over embeddings |
+| **Conceptual** | `:CodeEntity`, `:File`, `:Fact` | Cypher pattern match (by name, predicate, label, traversal) |
+
+The conceptual layer doesn't need its own embeddings: it inherits semantic locality through edges to the perceptual layer. "Find facts about deployment" → KNN over observations for "deployment" → traverse `:EVIDENCE_FOR` to facts. Two hops, one embedding round-trip, structurally clean.
+
+The strict layer order is enforced by the edges:
+
+```
+:Fact ← :EVIDENCE_FOR ← :Observation -[:MOTIVATES]→ :Chunk -[:DOCUMENTS]→ :CodeEntity
+                                                    └ :OF_FILE → :File
+```
+
+`:Observation` does not link directly to `:CodeEntity` — it goes through a `:Chunk`. If an agent wants to anchor an observation to a code entity that has no documenting chunk, the right move is to write the doc first; this preserves the "facts not in chunks are a smell" rule.
+
+**Why `:MOTIVATES` points from observation to chunk** (and not the other way): chunks are documented manifestations of agent-noticed observations. A chunk *needs* to be motivated by at least one observation to count as live, verified material in the system; a chunk with no incoming `:MOTIVATES` is unverified content that hasn't been engaged with. The agent's job, when it reads such a chunk, is either to make an observation about it (which then anchors via this edge — a kind of read-time verification) or to flag it for removal/update. The direction encodes an epistemological stance: documentation is not authoritative by virtue of existing; it earns its place by being grounded in observations the agent has either made or read and re-affirmed.
+
+### New labels
+
+| Label | Properties | Indices |
+|---|---|---|
+| `:Fact` | `subject` (string), `predicate` (string — see kernel below), `object` (string), `created_at` (ms), `last_verified_at` (ms, optional) | range on `(subject, predicate)`; fulltext on `(subject, object)` |
+| `:Observation` | `content` (string), `created_at` (ms), `last_distilled_at` (ms, optional), `vector` (512-dim) | vector on `Observation.vector` |
+| `:Protocol` | TBD | TBD |
+
+Notes:
+
+- `:Fact` is **not** embedded. Triplet rendering produces short strings whose embeddings have poor representational quality compared to sentence-length observations; structural access (predicate, subject, object) and inherited locality through `:EVIDENCE_FOR` are sufficient.
+- `:Fact` carries `last_verified_at` because semantic claims age and need re-checking. `:Observation` carries `last_distilled_at` because episodic records age into either pruning or distillation. `:Chunk` carries `last_distilled_at` for the same reason — to surface chunks no observation has yet been distilled from.
+
+### New edges
+
+| Edge | From → To | Meaning |
+|---|---|---|
+| `:EVIDENCE_FOR` | `:Observation` → `:Fact` | The observation provides episodic backing for the semantic fact. **Required:** every `:Fact` must have ≥ 1 incoming `:EVIDENCE_FOR`. Facts without grounding don't enter the graph. |
+| `:MOTIVATES` | `:Observation` → `:Chunk` | (Optional, many-to-many) The observation justifies the chunk's existence in the docs. Covers three cases under one edge: (a) the observation's content is contained in / has been written into the chunk; (b) the observation motivated the chunk being written in the first place (write-direction); (c) the observation was made while reading an existing chunk and now backs its continued inclusion (read-direction = epistemological re-affirmation). Pure runtime observations (about the project, the user, or a topic — not anchored to any chunk) have no outgoing `:MOTIVATES`. |
+
+`:EVIDENCE_FOR` replaces the earlier `:SUPPORTS` — "evidence for" is epistemically more honest, claiming inductive backing rather than implying deductive proof.
+
+No `:CONTRADICTS`, no `:SUPERSEDES` are stored. Contradictions are detected at write/recall time via semantic search over nearby observations and structural check on conflicting fact triplets, then *resolved immediately* — by re-checking against the codebase, the current docs, or the user — rather than persisted as edges that nobody reviews.
+
+### Predicate kernel
+
+`:Fact.predicate` is **kernel + open-set**: a small set of well-known predicates that the future inference engine reasons over, plus arbitrary user-defined strings that the engine treats as opaque labels.
+
+The starting kernel is seven predicates:
+
+| Predicate | Logical character | Role |
+|---|---|---|
+| `is_a` | transitive (extensional) | Instance attribution. Foundation for syllogisms. |
+| `subtype_of` | transitive | Class subsumption. Distinct from `is_a` (instance vs. class). |
+| `part_of` | transitive | Mereology. |
+| `equivalent_to` | symmetric, transitive | Identity / co-reference. Powers unification. |
+| `incompatible_with` | symmetric | Drives mechanical contradiction detection at distillation time. |
+| `causes` | (informally) transitive | Causal chains; key for procedural / diagnostic reasoning. |
+| `requires` | transitive | Dependency / prerequisite. |
+
+Open-set examples (allowed but inert to the engine): `uses`, `defined_in`, `documented_by`, `produces`, `prevents`, `has_property`. Anything domain-specific.
+
+`subject` and `object` are strings. Some will happen to match the `name` of a `:CodeEntity` or other `:Searchable` node in the same graph — agents can resolve these to node IDs at query time. Direct node-pointer fields on `:Fact` are deliberately omitted to keep the schema portable across graphs (a fact in `memory` referring to `EventViewImpl` doesn't have a node-pointer because the entity lives in another graph).
+
+### Fact-axiom edges (for the future inference engine)
+
+These edges are reserved for an inference engine that has not yet been implemented. They model classical deductive reasoning:
+
+| Edge | From → To | Meaning |
+|---|---|---|
+| `:ENTAILS` | `:Fact` → `:Fact` | Single-premise deductive entailment. |
+| `:INSTANCE_OF` | `:Fact` → `:Fact` | One fact's subject is an instance of another's. |
+| `:SUBTYPE_OF` | `:Fact` → `:Fact` | Category subsumption between fact subjects. |
+| `(:Rule)-[:PREMISE]->(:Fact)` | rule node → premise | Connects a `:Rule` to one of its premise facts. |
+| `(:Rule)-[:CONCLUDES]->(:Fact)` | rule node → conclusion | Connects a `:Rule` to the fact it derives. |
+
+#### `:Rule` as a reified n-ary relation
+
+Property graphs only support binary edges (one source, one target). A real inference rule is often n-ary — *"if A and B and C then D"* — and can't be encoded as a single edge. The standard solution (used by RDF/OWL/SWRL and Datalog over property graphs) is to **reify the rule itself as a node**, then attach edges to all the facts involved:
+
+```
+        ┌──────────────────────────────┐
+        │ :Fact                        │ ← :PREMISE ──┐
+        │  Socrates / is_a / man       │              │
+        └──────────────────────────────┘              │
+                                                  ┌───┴───┐
+        ┌──────────────────────────────┐          │ :Rule │
+        │ :Fact                        │ ← :PREMISE│       │
+        │  man / subtype_of / mortal   │          └───┬───┘
+        └──────────────────────────────┘              │
+                                                  :CONCLUDES
+                                                      ▼
+                                        ┌──────────────────────────────┐
+                                        │ :Fact                        │
+                                        │  Socrates / is_a / mortal    │
+                                        └──────────────────────────────┘
+```
+
+`:Rule` carries metadata about the inference itself:
+
+| Property | Meaning |
+|---|---|
+| `name` | Human label (e.g. `"transitive subtype reasoning"`, `"M-series RediSearch incompatibility"`). |
+| `kind` | The reasoning pattern (`modus_ponens`, `transitive_closure`, `instantiation`, ...). |
+| `confidence` | Optional, for defeasible rules where the conclusion isn't deductively forced. |
+| `created_at`, `last_verified_at` | Lifecycle, same as `:Fact`. |
+
+`:ENTAILS`, `:INSTANCE_OF`, and `:SUBTYPE_OF` cover all binary inference cases directly — they don't need a `:Rule` node. Reification only kicks in when a rule has more than one premise.
+
+### Maintenance queries
+
+```cypher
+// stale facts → re-verify (no observation has confirmed it lately)
+MATCH (f:Fact)
+WHERE f.last_verified_at < timestamp() - 90*86400000
+RETURN f
+
+// observations seen but never distilled into a fact → prune candidates
+MATCH (o:Observation)
+WHERE NOT (o)-[:EVIDENCE_FOR]->()
+  AND o.created_at < timestamp() - 30*86400000
+RETURN o
+
+// chunks not yet motivated by any observation → unverified material
+MATCH (c:Chunk) WHERE NOT (c)<-[:MOTIVATES]-() RETURN c
+
+// what observations motivate chunks that document EventViewImpl? (conceptual ← perceptual traversal)
+MATCH (:Searchable {name:'EventViewImpl'})<-[:DOCUMENTS]-(c:Chunk)<-[:MOTIVATES]-(o:Observation)
+OPTIONAL MATCH (o)-[:EVIDENCE_FOR]->(f:Fact)
+RETURN o.content, collect({subject:f.subject, predicate:f.predicate, object:f.object}) AS facts
+```
+
+### Skill-side rules (out of band)
+
+The schema is permissive; the discipline lives in the skill the agent runs:
+
+- **No orphan facts.** Every `:Fact` has ≥ 1 incoming `:EVIDENCE_FOR`. Direct fact writes are forbidden — distillation (observation first, then fact derived from it) is the only entry path.
+- **Observations motivate chunks; chunks need observations.** When an agent reads or writes a chunk, it should anchor its takeaway as an `:Observation` linked via `(:Observation)-[:MOTIVATES]->(:Chunk)`. A chunk with no incoming `:MOTIVATES` is unverified material — either to be engaged with (and an observation made) or pruned. Conversely, when an agent has an observation about a code entity that has *no* documenting chunk yet, the right move is to write the doc first; this preserves the layer separation (observations reach code entities only through chunks).
+- **Resolve contradictions on detection.** Write-time semantic search over nearby observations surfaces conflicts; structural check on candidate fact triplets against existing facts catches the rest. Resolve before storing — re-check against code, docs, or user.
+- **Distill at runtime via the agent.** Distillation is intended to be agent-orchestrated through the MCP surface (multi-turn: write observation → server returns similar facts → agent decides which to link or whether to propose a new triplet). Tool design deferred until data design is fully ratified.
 
 ## MCP tool surface
 
