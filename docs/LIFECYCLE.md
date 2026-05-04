@@ -83,11 +83,58 @@ Observations don't fall out of files mechanically. They're produced by an LLM re
 
 ### Grouping strategy
 
-Three signals available, used in priority order:
+Three signals available, used together rather than in sequence:
 
-1. **Vector similarity (KNN over chunk embeddings).** Surfaces chunks that talk about overlapping topics regardless of file location. Use as the primary clustering signal.
-2. **Shared `:DOCUMENTS` targets.** Chunks that document the same code entity belong together — they're describing the same subject from different angles. Use as a tie-breaker / merge signal on top of KNN clusters.
-3. **Breadcrumb prefix locality.** Chunks from the same heading section in the same file. Use as a fallback when neither KNN nor `:DOCUMENTS` produces a meaningful group (e.g., for files with no code references).
+1. **Vector similarity (KNN over chunk embeddings).** Surfaces chunks that talk about overlapping topics regardless of file location. Primary clustering signal.
+2. **Shared `:DOCUMENTS` targets.** Chunks that document the same code entity belong together — they're describing the same subject from different angles. Used as a structural boost on top of vector similarity.
+3. **Breadcrumb prefix locality / same source file.** Chunks from the same heading section in the same file have local coherence. Smaller boost.
+
+### Cluster identification (used by §4 and §7)
+
+Both the chunk interview (§4) and the fact-generation step (§7) need **clusters of related items** — same algorithm, different inputs. The clustering must satisfy three constraints simultaneously:
+
+1. **Coherence** — items in a cluster should overlap topically.
+2. **Coverage** — every item should land in some cluster (no orphans during distillation).
+3. **Bounded size** — each cluster must fit in an LLM context window with headroom.
+
+No off-the-shelf algorithm satisfies all three cleanly. Mesial uses a **greedy budget-aware KNN walk with structural boosting**:
+
+**Inputs**: items with vectors + structural metadata; per-cluster budget (chars or tokens); similarity function.
+
+**Similarity function** (returns a value in roughly [0, 1.5]; higher = more related):
+- Base: cosine similarity between the two items' embeddings, mapped to `[0, 1]`.
+- Structural bonus when at least one shared neighbor:
+  - For chunks: `+0.3` if they share a `:DOCUMENTS` target or breadcrumb prefix; `+0.2` if same source file.
+  - For observations: `+0.3` if they share a `:MOTIVATES` target chunk; `+0.2` if motivated chunks are in the same file.
+- (Boost magnitudes are policy — tunable; the structural signals are what matters, not the exact weights.)
+
+**Algorithm**:
+1. **Index lookup** — KNN-10 over each item's vector. Single query against FalkorDB's existing vector index; cheap.
+2. **Seed order** — sort items by **structural degree** (information-rich first):
+   - Chunks: outgoing `:DOCUMENTS`-edge count.
+   - Observations: outgoing `:EVIDENCE_FOR`-edge count (or `:MOTIVATES` count if no facts yet).
+3. **Pick next seed** — the highest-degree unassigned item.
+4. **Greedy expand** — among the seed's KNN-10, take the highest-similarity unassigned neighbor (above a min threshold of `0.3` to avoid forcing weak matches), add to cluster, deduct from budget. Repeat until budget exhausted or no qualified neighbor remains.
+5. **Emit cluster**, mark items assigned, return to step 3 with the next-highest unassigned seed.
+6. **Singleton post-pass** — if a cluster has only one item but budget remains, try to merge it into the nearest cluster that still has budget headroom; otherwise emit as a single-item group (the interview degrades gracefully to per-item).
+
+**Edge cases**:
+- *Tiny graph* (< 5 items): all items in one group, skip clustering.
+- *Disconnected graph* (no qualified neighbors anywhere — graph just embedded, no edges yet): each item becomes its own group; the interview degrades to per-item, which is the worst case but still functional.
+- *Hot-spot* (one item has many strong KNN matches): greedy gives it the cluster it deserves, then moves on; no backtracking.
+
+**Why this and not k-means / HDBSCAN / Louvain?**
+- *k-means* needs `k` upfront; the natural size is driven by budget, not by `k`.
+- *DBSCAN / HDBSCAN* are nice for finding natural density clusters but don't respect the budget constraint.
+- *Louvain / Leiden* produce good global structure (modularity-optimal) but need post-processing to enforce size and bring an external dependency.
+- *Greedy KNN-walk*: simple to implement in-package, naturally respects budget, deterministic given seed order, can be swapped for a smarter algorithm later without changing the API.
+
+**Recomputation**: clusters are ephemeral. Built fresh per interview round, never stored. The same chunk may land in different clusters on different runs depending on which items are already verified — that's fine, clusters are scaffolding for the interview, not knowledge in their own right. Cost is `O(N × 10)` similarity lookups per round, cheap up to ~10K items.
+
+**Tunables** (exposed as flags / MCP args):
+- `--budget-chars` (default 24000, ≈ 6 KB tokens at the chunker's typical density)
+- `--min-similarity` (default 0.3 — below this, neighbors aren't pulled in even if budget allows)
+- `--seed-by` (default `degree`; alternatives: `random` for variation between runs, `created_at` for chronological coverage)
 
 ### Group size
 
@@ -193,10 +240,10 @@ Same multi-turn pattern as observations, one layer up.
 
 ### Clustering observations
 
-Group observations using the same KNN-over-vector approach used for chunks in Section 4. Each cluster represents a *theme* — observations that together describe one aspect of the system.
+Same algorithm as §4 ("Cluster identification") with observation-specific signals: structural bonus is `+0.3` for shared `:MOTIVATES` target chunks, `+0.2` for chunks in the same source file. Each cluster represents a *theme* — observations that together describe one aspect of the system.
 
-- Per cluster: 5–15 observations (smaller than chunk groups since observations are denser per byte).
-- Aim for clusters where the centroid distance is tight — loose clusters yield noisy facts.
+- Per cluster: 5–15 observations (smaller than chunk groups since observations are denser per byte). The `--budget-chars` default still applies; observations just pack more per byte.
+- The min-similarity threshold becomes more important here: loose clusters yield noisy facts. Tighten to `0.4` if the LLM's proposed facts come back unfocused.
 
 ### Per-cluster proposal
 
