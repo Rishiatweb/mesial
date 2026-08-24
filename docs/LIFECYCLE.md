@@ -246,6 +246,8 @@ When chunks are regenerated:
 
 Below a confidence threshold, re-linked observations queue for human review via `propose_then_confirm`.
 
+A remap must also carry forward `:Chunk.last_distilled_at` from the old node to the new one. That property exists to answer "has this content actually been engaged with" (§ Health metrics); resetting it on every reanchor would make freshly-reanchored chunks look unverified again immediately after a routine doc edit, which would corrupt `chunks_without_observations` and the coverage queue right when reanchoring is supposed to be *preserving* prior verification, not erasing it. `created_anew` chunks (no old chunk to remap from) correctly start with no `last_distilled_at`, same as any new chunk today.
+
 ### `reanchor` primitive
 
 ```
@@ -674,10 +676,10 @@ Three **architectural commitments** make the invariants enforceable:
 2. **No-orphan-facts** — facts only enter the graph through distillation with at least one supporting observation — keeps the conceptual layer grounded in evidence.
 3. **MCP elicitation as the universal commit gate** — the user is the commit gate for observations, facts, derivations, contradiction resolutions, re-anchoring decisions — keeps the system trustworthy without requiring the LLM to be infallible.
 
-Three **open design issues** must land before deep memory work:
-- [Issue #6](https://github.com/mknw/mesial/issues/6) — `:Protocol` schema (procedural memory)
-- [Issue #8](https://github.com/mknw/mesial/issues/8) — Anchor stability and re-anchoring (load-bearing for everything else)
-- [Issue #9](https://github.com/mknw/mesial/issues/9) — Test and runtime trace ingestion
+Three **open design issues**, with different blast radii — not equally blocking:
+- [Issue #8](https://github.com/mknw/mesial/issues/8) — Anchor stability and re-anchoring. Broadly load-bearing: it gates `reanchor`, a **Tier-1** backbone primitive, so it must land before any Tier-1 memory work ships.
+- [Issue #6](https://github.com/mknw/mesial/issues/6) — `:Protocol` schema (procedural memory). Gates only its own Tier-3 feature (`:Protocol` ingestion/consumption); doesn't block fact generation, `verify`, or anything in Tier 1–2.
+- [Issue #9](https://github.com/mknw/mesial/issues/9) — Test and runtime trace ingestion. Same scope as #6 — gates only `:Test`/`:Failure` ingestion, nothing upstream of it.
 
 The right next step after this document is to design the **Tier 1 MCP tools** — `surface` (MVP shape), `add_observation` runtime capture, `impact`, and `reanchor` — and ship them. With those in place, the agent's online-use loop closes and every commit cycle becomes a memory deposit.
 
