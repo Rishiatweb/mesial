@@ -1,6 +1,8 @@
 # Onboarding
 
-A field guide for the next engineer touching this repo — what mesial is, why it looks the way it does, and where it actually stands today. Companion to [`DESIGN.md`](DESIGN.md) (concepts), [`ARCHITECTURE.md`](ARCHITECTURE.md) (engineering view), [`RATIONALE.md`](RATIONALE.md) (decision log), and `LIFECYCLE.md` (the roadmap — lives on the `feat/memory-mcp` branch, unmerged, see PR #10). This document exists to connect those to each other and to the actual state of the code, git history, and open issues — read it first, then go deep on whichever of the others you need.
+A field guide for the next engineer touching this repo — what mesial is, why it looks the way it does, and where it actually stands today. Companion to [`DESIGN.md`](DESIGN.md) (concepts), [`ARCHITECTURE.md`](ARCHITECTURE.md) (engineering view), [`RATIONALE.md`](RATIONALE.md) (decision log), and [`LIFECYCLE.md`](LIFECYCLE.md) (the roadmap). This document exists to connect those to each other and to the actual state of the code, git history, and open issues — read it first, then go deep on whichever of the others you need.
+
+> **A note on which repo this describes.** Most of this doc, including the PR/issue numbers below, was written against upstream `mknw/mesial`'s state. This fork (`Rishiatweb/mesial`) has since diverged: its mirror of upstream PR #10 (fork PR #5) is **merged**, carrying two additional fixes upstream's version doesn't have — see `docs/IMPLEMENTATION.md` §5 for the fork-vs-upstream breakdown. Where this doc says "PR #10" or "unmerged," that's upstream's status, not necessarily this fork's.
 
 ## 1. Start here: the 60-second version
 
@@ -256,7 +258,9 @@ Pulled directly from git history, open issues, and the open pull request — not
 
 **Merged and live.** PRs #2 through #5: documents layer + linker, the `h9s-cli`/`internal/pipeline` split, ROADMAP + vault-graph schema docs, and the memory-layer foundation. Four MCP tools running today, code + doc graph fully working end to end.
 
-**Open PR #10 — `docs/LIFECYCLE.md`.** 684 lines, unmerged. A design document, not code — the online-first operating manual for how mesial should behave over time (full breakdown in [§15](#15-the-roadmap-online-first-memory)). Its checklist is blocked on one unchecked box: *"Reviewer to check the rewrite addresses the PR #7 review feedback adequately."* Nothing else is gating it. (PR #7 was accidentally closed when its base branch got deleted post-merge — GitHub auto-closes instead of retargeting — so #10 is #7's content, replayed on the same branch, with the review thread preserved on the original.)
+**Open PR #10 (upstream) — `docs/LIFECYCLE.md`.** 684 lines. A design document, not code — the online-first operating manual for how mesial should behave over time (full breakdown in [§15](#15-the-roadmap-online-first-memory)). Upstream's checklist is blocked on one unchecked box: *"Reviewer to check the rewrite addresses the PR #7 review feedback adequately."* Nothing else is gating it there. (PR #7 was accidentally closed when its base branch got deleted post-merge — GitHub auto-closes instead of retargeting — so #10 is #7's content, replayed on the same branch, with the review thread preserved on the original.)
+
+**This fork has already moved past that.** The fork's mirror (PR #5, `Rishiatweb/mesial`) went through an actual review pass — it surfaced two real issues (a tiering overstatement in the closing summary, and a missing `last_distilled_at` carry-forward rule in `reanchor`), both fixed, and the PR was merged into this fork's `main`. `docs/LIFECYCLE.md` on this repo is that corrected version, not upstream's. If those fixes should go back upstream, that's a separate decision — it's not this fork's repo to push to.
 
 **Three open issues, all explicitly scoped "design only":**
 
@@ -272,7 +276,7 @@ Pulled directly from git history, open issues, and the open pull request — not
 
 ## 15. The roadmap: online-first memory
 
-This section summarizes the unmerged `docs/LIFECYCLE.md` (PR #10) for a first read rather than as a spec — treat it as "here's the plan," not "here's what runs today."
+This section summarizes `docs/LIFECYCLE.md` (merged on this fork via PR #5, corrected from upstream's PR #10) for a first read rather than as a spec — treat it as "here's the plan," not "here's what runs today." The primitives it describes (`surface`, `impact`, `reanchor`, etc.) are still unimplemented regardless of which repo's copy of the doc you're reading — merging the doc didn't build the tools.
 
 **The seven-loop spine:**
 
@@ -334,8 +338,8 @@ If an agent skill follows this table mechanically, every commit cycle passes thr
 
 Ranked by how much you can get done before hitting a design decision that isn't yours to make yet:
 
-1. **Wire the memory layer into `cmd/ingest`.** Everything the MCP tools need already exists in `internal/pipeline/memory.go` — `AddObservation`, `CreateFactFromObservation`, `LinkObservationEvidence`, `SearchObservations`, `SearchFacts`. This is copying the pattern the four existing tools already use (thin `mcp.AddTool` adapter → pipeline call → format result), not inventing anything. Highest leverage-to-effort ratio in the repo right now, and it's Tier 1 work per LIFECYCLE.md's own prioritization.
-2. **Review and merge PR #10.** It's a doc, the design is thorough, and it's blocking nothing except its own unchecked review checkbox. Clearing it makes LIFECYCLE.md the load-bearing reference doc it's meant to be instead of a branch nobody's looking at.
+1. **Wire the memory layer into `cmd/ingest`.** Everything the MCP tools need already exists in `internal/pipeline/memory.go` — `AddObservation`, `CreateFactFromObservation`, `LinkObservationEvidence`, `SearchObservations`, `SearchFacts`. This is copying the pattern the four existing tools already use (thin `mcp.AddTool` adapter → pipeline call → format result), not inventing anything. Highest leverage-to-effort ratio in the repo right now, and it's Tier 1 work per LIFECYCLE.md's own prioritization. Still true on this fork even though LIFECYCLE.md itself is now merged here — merging the doc didn't wire the tools.
+2. **~~Review and merge PR #10~~ — done on this fork.** Fork PR #5 went through review, picked up two real fixes, and merged. Upstream's PR #10 is still open with the original (uncorrected) content, in case that's relevant to you.
 3. **Anchor stability (issue #8), once someone actually needs it.** The design sketch above is solid, but building `reanchor` before there's memory data worth protecting is building insurance for a house that doesn't exist yet. Do #1 first — once agents are writing real observations through MCP, the churn problem stops being theoretical and this jumps to the top.
 4. **Leave #6 and #9 alone for now.** Both issues say so themselves — "design only," deferred until a concrete use case exists. Implementing ahead of that isn't initiative, it's skipping a step the previous author deliberately built into the process.
 
@@ -356,4 +360,4 @@ One more thing worth noticing about how this repo was built: every merged PR is 
 
 ---
 
-*Compiled from the repo at `main @ fff0d40`, PR #10 (`feat/memory-mcp`), and issues #6/#8/#9 — every claim above traces to a file, a commit, or an issue body, not to inference about intent.*
+*Originally compiled from upstream `mknw/mesial` at `main @ fff0d40`, PR #10 (`feat/memory-mcp`), and issues #6/#8/#9 — every claim traces to a file, a commit, or an issue body, not to inference about intent. Since then this fork merged its own mirror (PR #5, with two fixes upstream doesn't have) — see the note at the top of this document and `docs/IMPLEMENTATION.md` §5 for what's changed.*

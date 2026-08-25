@@ -83,5 +83,6 @@ Deliberate non-goals, with reasoning in [`RATIONALE.md`](RATIONALE.md):
 
 - [`ONBOARDING.md`](ONBOARDING.md) — a guided field-guide read: what's built, why it's shaped this way, and where a new engineer should start.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — the engineering view: services, packages, pipelines, data model.
+- [`LIFECYCLE.md`](LIFECYCLE.md) — what happens when, in what order: bootstrap, distillation, online use.
 - [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — current build status, implementation/productionizing/research pathways, live PR & issue tracker.
 - [`RATIONALE.md`](RATIONALE.md) — decision-by-decision explainer.

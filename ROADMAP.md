@@ -30,7 +30,7 @@ For the granular, file-level breakdown of what's shipped vs. wired-to-MCP vs. CL
 
 ### Documentation
 - `docs/ONBOARDING.md` (guided field-guide), `docs/DESIGN.md` (high-level), `docs/ARCHITECTURE.md` (engineering view), `docs/RATIONALE.md` (decision-by-decision), `docs/IMPLEMENTATION.md` (build log + implementation/productionizing/research pathways, live PR & issue tracker)
-- `docs/LIFECYCLE.md` (bootstrap, distillation, online use) exists on the `feat/memory-mcp` branch, unmerged — see PR #10
+- `docs/LIFECYCLE.md` (bootstrap, distillation, online use) — merged into this fork via PR #5; still unmerged upstream at `mknw/mesial` (PR #10)
 
 ## Next
 

@@ -74,12 +74,14 @@ Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boun
 
 ## 5. Open PRs, issues, and branches — acute descriptions
 
+**Two repos, two number sequences.** The table below is **upstream** (`mknw/mesial`)'s tracker, as swept at the time this doc was first written. This fork (`Rishiatweb/mesial`) mirrors most of this under its own issue/PR numbers, and has already diverged in one important way — see the fork-status table right after.
+
 | # | Type | Branch | State | What it actually is |
 |---|---|---|---|---|
-| 10 | PR | `feat/memory-mcp` | **open** | `docs/LIFECYCLE.md` rewrite (684 lines) — online-first operating manual. Blocked on one unchecked review-checklist item: "reviewer to check the rewrite addresses PR #7 feedback." Supersedes #7, which was closed by an accidental base-branch deletion (GitHub auto-closes rather than retargets), not by rejection — #7's review thread is preserved and referenced. |
-| 8 | Issue | — | **open** | Anchor stability & re-anchoring spec. Design-only. Flagged in PR #7's review as the **load-bearing risk** for the entire memory layer — every other memory feature silently assumes chunk identity survives re-ingest, and today it doesn't (§4 above, worked example in `ONBOARDING.md` §15). |
-| 9 | Issue | — | **open** | `:Test`/`:Failure`/`:EXERCISES` ingestion design. Raised alongside #8 in the same PR #7 review, as an alternative high-leverage population strategy. Explicitly full-design-pass scope, no implementation. |
-| 6 | Issue | — | **open** | `:Protocol` schema design (simplified P-Plan). Reserved as a label in PR #5 with no schema; this issue is the schema-design follow-up. Deferred until a concrete protocol use case exists. |
+| 10 | PR | `feat/memory-mcp` | **open, upstream** | `docs/LIFECYCLE.md` rewrite (684 lines) — online-first operating manual. Blocked on one unchecked review-checklist item: "reviewer to check the rewrite addresses PR #7 feedback." Supersedes #7, which was closed by an accidental base-branch deletion (GitHub auto-closes rather than retargets), not by rejection — #7's review thread is preserved and referenced. |
+| 8 | Issue | — | **open, upstream** | Anchor stability & re-anchoring spec. Design-only. Flagged in PR #7's review as the **load-bearing risk** for the entire memory layer — every other memory feature silently assumes chunk identity survives re-ingest, and today it doesn't (§4 above, worked example in `ONBOARDING.md` §15). |
+| 9 | Issue | — | **open, upstream** | `:Test`/`:Failure`/`:EXERCISES` ingestion design. Raised alongside #8 in the same PR #7 review, as an alternative high-leverage population strategy. Explicitly full-design-pass scope, no implementation. |
+| 6 | Issue | — | **open, upstream** | `:Protocol` schema design (simplified P-Plan). Reserved as a label in PR #5 with no schema; this issue is the schema-design follow-up. Deferred until a concrete protocol use case exists. |
 | 1 | Issue | — | closed | "Epistemic layer: DOCUMENTS edges and high-level retrieval verbs" — resolved by PR #2 (documents layer + linker). |
 | 7 | PR | `feat/memory-mcp` | closed | Original LIFECYCLE.md draft + review. Closed by accident (base branch deleted post-merge), not by rejection. Content lives on in #10. |
 | 5 | PR | `feat/memory-layer-foundation` | merged | `:Fact`/`:Observation`/`:GraphMeta` + `h9s-cli memory` subcommand — everything inventoried in §1 above as "done, CLI-only." |
@@ -87,7 +89,20 @@ Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boun
 | 3 | PR | `feat/mcp-sdk-harness` | merged | `cmd/h9s-cli` dev harness + the `internal/pipeline` extraction that keeps MCP and CLI behavior in lock-step. |
 | 2 | PR | `feat/documents-layer` | merged | Documents layer (chunking + embedding + storage) and the doc-to-code linker; docs split into `DESIGN.md`/`ARCHITECTURE.md`/`RATIONALE.md`. |
 
-**Remote branches** (as of this check): `feat/memory-mcp` (PR #10, open — the only unmerged branch with live work), `docs/roadmap-notes-schema`, `feat/documents-layer`, `feat/mcp-sdk-harness` (all three merged; stale remote branches GitHub hasn't auto-deleted).
+**Remote branches, upstream** (as swept): `feat/memory-mcp` (PR #10, open — the only unmerged branch with live work at the time), `docs/roadmap-notes-schema`, `feat/documents-layer`, `feat/mcp-sdk-harness` (all three merged; stale remote branches GitHub hasn't auto-deleted).
+
+### Fork status (`Rishiatweb/mesial`) — where this repo has diverged from the table above
+
+| Fork # | Mirrors upstream | State on this fork | Divergence |
+|---|---|---|---|
+| PR #5 | #10 (`feat/memory-mcp`) | **merged** | Went through an actual review pass on this fork: found a tiering overstatement in LIFECYCLE.md's closing summary and a missing `last_distilled_at` carry-forward rule in `reanchor`. Both fixed (commit `186489b`) before merging. `docs/LIFECYCLE.md` on this fork's `main` is that corrected version — upstream #10 still carries the original text. |
+| PR #6 | n/a (fork-only) | open | This doc + `ONBOARDING.md` + README/ROADMAP/DESIGN cross-reference fixes. |
+| Issue #2 | #6 | open | `:Protocol` schema — unchanged from upstream. |
+| Issue #3 | #8 | open | Anchor stability — unchanged from upstream. |
+| Issue #4 | #9 | open | `:Test`/`:Failure` ingestion — unchanged from upstream. |
+| Issue #1 | #1 | closed | Mirrors upstream's closed state. |
+
+Upstream issues #6/#8/#9 (mirrored as fork #2/#3/#4) are unaffected by any of this — same open design questions either way, this fork just has its own copies to track against.
 
 ## 6. Cross-references
 
@@ -95,7 +110,7 @@ Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boun
 - MCP tool surface (inputs, behavior) → [`ARCHITECTURE.md` — MCP tool surface](ARCHITECTURE.md#mcp-tool-surface)
 - Config / env vars → [`ARCHITECTURE.md` — Configuration](ARCHITECTURE.md#configuration)
 - Full decision-by-decision rationale → [`RATIONALE.md`](RATIONALE.md)
-- The online-first lifecycle this pathway list is drawn from → `docs/LIFECYCLE.md` on `feat/memory-mcp` (unmerged, PR #10)
+- The online-first lifecycle this pathway list is drawn from → [`LIFECYCLE.md`](LIFECYCLE.md) (merged on this fork via PR #5; upstream's copy on `feat/memory-mcp`/PR #10 still has the pre-fix text)
 
 ---
 
