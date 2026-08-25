@@ -10,7 +10,7 @@ The repository is named **mesial** after the *mesial temporal lobe* — the regi
 
 Mesial parses TypeScript with tree-sitter + `typescript-language-server`, chunks markdown by heading boundaries, and stores both into a per-repository FalkorDB graph. Doc chunks are linked to the code entities they mention via a `DOCUMENTS` edge, so an agent can navigate from a topic to its code, or from a code entity to the docs that describe it.
 
-For background, see [`docs/DESIGN.md`](docs/DESIGN.md). For the engineering view, [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For the why behind specific choices, [`docs/RATIONALE.md`](docs/RATIONALE.md).
+Start with [`docs/ONBOARDING.md`](docs/ONBOARDING.md) for a guided field-guide read. For background, see [`docs/DESIGN.md`](docs/DESIGN.md). For the engineering view, [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For the why behind specific choices, [`docs/RATIONALE.md`](docs/RATIONALE.md). For current build status and what's next, [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
 ## Quick start
 
@@ -113,22 +113,24 @@ ORDER BY c.line_start
 cmd/
   chunker/        markdown chunker as a CLI
   ingest/         the MCP server
+  h9s-cli/        direct dev harness over internal/pipeline (bypasses MCP)
 internal/
   chunking/       heading-boundary markdown chunker
   embedding/      llama-server client (batched, Matryoshka-truncated)
-  falkorstore/    FalkorDB graph operations (chunks + code graph)
+  falkorstore/    FalkorDB graph operations (chunks, code graph, and the Fact/Observation memory layer)
   analyzer/       Analyzer interface + TS analyzer + two-pass orchestrator
   lspclient/      typescript-language-server client
   doclinker/      doc-to-code identifier-mention linker
+  pipeline/       orchestration shared by cmd/ingest and cmd/h9s-cli — ingest, analyze, link, and memory operations
 configs/          MCP gateway catalog and config template
-docs/             architecture, design, rationale
+docs/             onboarding, design, architecture, rationale, implementation status
 ```
 
 ## Development
 
 ```bash
 go build ./...                          # all binaries
-go test ./...                           # currently: doclinker unit tests
+go test ./...                           # currently: doclinker + memorystore unit tests
 go run ./cmd/chunker /path/to/file.md   # standalone chunker
 ```
 
