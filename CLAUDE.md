@@ -47,8 +47,12 @@ Env vars for `cmd/ingest`: `FALKOR_ADDR` (default `localhost:6381`), `EMBEDDING_
 Embedding model must be running separately:
 
 ```bash
-llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090
+make embed
 ```
+
+The GGUF itself lives in the hames-playground checkout
+(`~/Code/kg-agent/models/`), which owns the canonical `make embed`; this repo
+keeps no second copy. `make embed` here points at that path via `EMBED_MODEL`.
 
 No tests or CI configured yet.
 
