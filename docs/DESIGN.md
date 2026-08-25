@@ -82,4 +82,5 @@ Deliberate non-goals, with reasoning in [`RATIONALE.md`](RATIONALE.md):
 ## Where to go next
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — the engineering view: services, packages, pipelines, data model.
+- [`LIFECYCLE.md`](LIFECYCLE.md) — what happens when, in what order: bootstrap, distillation, online use.
 - [`RATIONALE.md`](RATIONALE.md) — decision-by-decision explainer.
