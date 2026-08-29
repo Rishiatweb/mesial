@@ -36,41 +36,112 @@ Ordered by dependency, not just priority — later items build on earlier ones.
 
 ## 3. Pathway: Productionizing
 
-From `ROADMAP.md`'s "Other near-term" and `ARCHITECTURE.md`'s "Caveats and known limits" sections — the work that makes mesial reliable at scale rather than functionally complete.
+From `ROADMAP.md`'s "Other near-term" and `ARCHITECTURE.md`'s "Caveats and known limits" sections — the work that makes mesial reliable at scale rather than functionally complete. None of this blocks anyone from using mesial today; it's what turns "works when I ran it" into "works unattended, for other people, indefinitely." Ordered roughly by how much it currently costs someone using the tool.
 
-- **Push the `ingest` Docker image to a registry** for cross-machine use (currently built locally via `Dockerfile.ingest` only).
-- **Incremental re-indexing** — detect changed files via git diff, re-ingest only those, instead of every `analyze_repository` call re-walking the whole tree. LIFECYCLE.md's "diff as synchronization signal" section (`CodeEntityChanged`/`ChunkChanged`/etc. event table) is the design for this.
-- **Hybrid search** (lexical + vector) in `search_documents` — pure KNN today; adding a lexical pass would catch exact-identifier queries KNN sometimes misses.
-- **LSP process pooling.** Today, every single `analyze_repository` call spawns a fresh `typescript-language-server` subprocess — a few seconds of cold start every time, always. Pooling by workspace root would remove this cost for repeated analysis of the same repo.
-- **Transactional `StoreChunks`.** Chunks are written one at a time; a failure mid-batch leaves a partial file state (self-healing on next re-ingest, but not atomic).
-- **Stale `:File` cleanup on rename.** Renaming a `.md` or source file leaves the old `:File` node behind with no chunks attached — acceptable today, a real cleanup problem once repos churn more.
-- **Health metrics + evaluation hook** (LIFECYCLE.md) — `documented_entity_ratio`, `chunk_anchor_stability_rate`, `facts_with_valid_evidence`, `stale_doc_candidates`, etc., plus a `mesial/eval/` fixture directory (`golden_surface_queries/`, `golden_impact_queries/`, ...) so tuning the clustering algorithm, the linker, or `reanchor` has a regression harness instead of vibes. This is the observability layer productionizing actually depends on — you can't productionize what you can't measure.
+### Registry-published `ingest` image
+
+Today `Dockerfile.ingest` only builds locally (`docker compose up -d ingest` builds from `context: .` every time). No image is published anywhere. Cross-machine or CI use means either rebuilding from source every time or manually `docker save`/`docker load`-ing a tarball. Fix is mechanical: pick a registry (GHCR is the obvious default given this already lives on GitHub), add a build-and-push step, pin a tag scheme (git SHA, or semver once there's a release cadence).
+
+### LSP process pooling
+
+Every single `analyze_repository` call spawns a fresh `typescript-language-server --stdio` subprocess (`internal/analyzer/orchestrator.go`, `pass2`) and tears it down at the end of the call (`lsp.Shutdown`). Cold start is a few seconds, every time, even for a repo you just analyzed thirty seconds ago. For occasional use this is a shrug; for anything approaching "re-analyze on every save" or a CI job that calls `analyze_repository` per PR, it's real, avoidable latency. Fix: pool by workspace root, keep a warm LSP process per repo, tear down on idle timeout. Complication worth flagging before starting: `typescript-language-server` holds project state (open documents, `tsconfig` resolution) — a pooled process needs `didClose`/`didOpen` bookkeeping between calls so stale state from a previous analysis doesn't leak into the next one.
+
+### Incremental re-indexing
+
+`analyze_repository` re-walks and re-parses every file in the repo on every call — no notion of "only what changed." For a large repo, or for the "call this on every commit" workflow the online-first lifecycle assumes, this is wasted work that scales with repo size instead of change size. `LIFECYCLE.md`'s "Diff as synchronization signal" section (the `CodeEntityChanged`/`CodeEntityMoved`/`ChunkChanged`/etc. event table) is the actual design for this — it's not a new idea to work out, it's a design already written, waiting for someone to wire git-diff detection into `internal/pipeline` and route the changed-file set through the existing per-file ingestion path instead of the full walk.
+
+### Hybrid (lexical + vector) search
+
+`search_documents` is pure KNN over `:Chunk.vector` today. Vector search is bad at exact-identifier recall — searching for `"EnsureMemoryIndex"` should obviously surface the chunk that names it verbatim, but a 512-dim embedding doesn't guarantee that ranks first. A lexical pass (even something as simple as a FalkorDB fulltext index on `Chunk.content`, unioned with the vector results and re-ranked) would catch the class of query where the user already knows the exact term they're looking for. Low-risk, additive — doesn't change existing behavior, just adds a second ranking signal.
+
+### Transactional `StoreChunks`
+
+`falkorstore.StoreChunks` writes one `:Chunk` node per Cypher query, in a loop, no transaction wrapping the batch. A failure partway through (network blip, FalkorDB restart) leaves a file's chunks partially written. It's self-healing — the next `ingest_documents`/`analyze_repository` call on that file does a full `DeleteBySource` + re-create — but between the failure and the next re-ingest, that file's graph state is inconsistent (some chunks present, some missing, `:DOCUMENTS` edges pointing at a mix of stale and fresh nodes). Worth wrapping in a single multi-statement Cypher transaction (FalkorDB supports this) once this stops being a "rare, self-heals anyway" risk and starts being a "happens often enough to notice" one.
+
+### Stale `:File` cleanup on rename
+
+Renaming a `.md` or source file leaves the old `:File` node behind, orphaned — no chunks or entities point at it anymore, but it's never deleted. Harmless at small scale (a few stray nodes), a real accumulating-cruft problem for a repo with meaningful churn over time. Fix needs a decision first, not just code: how do you *detect* a rename vs. a delete-and-unrelated-create? (Same question issue #8 is already working through for `:CodeEntity` renames via `signature_hash` matching — this is plausibly the same mechanism applied to `:File`, not a separate design.)
+
+### Health metrics + evaluation hook
+
+`LIFECYCLE.md`'s health-metrics table (`documented_entity_ratio`, `chunk_anchor_stability_rate`, `facts_with_valid_evidence`, `stale_doc_candidates`, `chunks_without_observations`, ...) and its proposed `mesial/eval/` fixture directory (`golden_surface_queries/`, `golden_impact_queries/`, `golden_reanchor_cases/`, ...) are both fully specified in the doc — nothing to design here, only to build. This is the one productionizing item that's a genuine *prerequisite* for the others rather than independent: you can't safely tune the clustering algorithm, the linker's precision/recall balance, or `reanchor`'s confidence thresholds without a regression harness telling you whether a change made things better or worse. Every other item on this list is optional polish; this one is what keeps future changes from being vibes-driven.
 
 ## 4. Pathway: Research — open design questions
 
-Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boundary. Each of these needs a decision before it can become a Pathway 2 (Implementation) item — building ahead of the decision means building the wrong shape.
+Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boundary. Each of these needs a decision before it can become a Pathway 2 (Implementation) item — building ahead of the decision means building the wrong shape. All three filed issues are explicitly scoped "design only, no implementation" in their own issue bodies — that scoping is deliberate, not an oversight to route around.
 
-**Issue #6 — `:Protocol` schema**, open questions verbatim from the issue:
-- Branching/conditional steps — BPMN territory; P-Plan doesn't model conditionals natively. New `:DECIDES_ON` edge, or leave it an agent-side concern?
-- Variable typing — free string, controlled vocabulary, or a pointer to a `:Fact` triplet?
-- Step granularity — is a `:Step` always atomic, or can protocols nest (P-Plan supports sub-plan composition)?
-- Linkage to facts/observations — does a `:Protocol` carry `:EVIDENCE_FOR`-style backing from successful-run observations?
-- Versioning — protocols evolve; supersession via a separate edge, or replace-in-place?
-- Explicitly out of scope until a concrete protocol use case (the issue suggests mesial's own deploy runbook) exists to drive the shape.
+### Issue #6 — `:Protocol` schema for procedural memory
 
-**Issue #8 — anchor stability & re-anchoring.** The mechanism is sketched (composite `content_hash`/`breadcrumb_hash` key, fallback chain, confidence scoring) — see `ONBOARDING.md` §15 for the worked example of why it's needed. Open questions: exact confidence thresholds for auto-remap vs. human review via `propose_then_confirm`; the equivalent stable-idREADMEentity scheme for `:CodeEntity` beyond `(name, path, src_start, src_end)` — likely `(name, path, signature_hash)` so line-shift edits don't break identity, but the hash's exact inputs aren't decided.
+**Why it exists.** `:Protocol` is the third memory node label alongside `:Fact` and `:Observation` — reserved by name in PR #5 (the memory-layer-foundation PR) but given no schema. It's meant to hold procedural knowledge — "how to do X" — which the issue argues is often more valuable for a coding agent than declarative facts: examples given are "how to add a new MCP tool," "how to debug LSP failures," "how to release the Docker image." Distinct from `:Fact` (a semantic claim) and `:Observation` (an episodic event) — this is the "how," not the "what" or "when."
 
-**Issue #9 — `:Test`/`:Failure` ingestion**, open questions verbatim:
-- Granularity — one `:Test` per test function, per `describe` block, or per file?
-- `EXERCISES` inference — static analysis (cheap, imprecise) vs. runtime instrumentation (precise, expensive) vs. both?
-- `:Failure` deduplication — same error across 5 runs: one node with a `run_count`, or five nodes?
-- Lifecycle — when does a `:Failure` age out? On resolution? When git history drops the relevant commits?
-- Observation linkage — an agent's fix-observation should `:MOTIVATES` a `:Failure` that's already in the past; does this clash with the observation→chunk `:MOTIVATES` semantic where the chunk is a present-tense documented manifestation?
+**Source.** A simplified subset of [P-Plan](https://www.opmw.org/model/p-plan/) (process-plan ontology, extends PROV-O) — take what's needed, drop the rest.
 
-**Deferred without an open issue yet, but named in `RATIONALE.md` §11 / `ARCHITECTURE.md`:**
-- Forward-chaining inference over `:ENTAILS`/`:INSTANCE_OF`/`:SUBTYPE_OF` and reified `:Rule` nodes (LIFECYCLE.md's `dlpfc` deep-reasoning tier) — deferred until fact density is high enough for derivations to mean anything.
-- Cross-repo / federated queries — would need either a query-fan-out layer or a single global graph (the latter already rejected, see `RATIONALE.md` decision 2).
-- Multi-language analyzers (Python, Go) — the `Analyzer` interface is already language-agnostic; no design question blocks this, just no demand yet.
+**Minimal sketch** (from the issue, not final):
+```
+:Protocol      {name, description, created_at, last_verified_at?}
+:Step          {name, description}
+:Variable      {name, type?}
+
+(:Protocol)-[:HAS_STEP]->(:Step)
+(:Protocol)-[:STARTS_WITH]->(:Step)
+(:Step)-[:PRECEDES]->(:Step)            // DAG, not just linear
+(:Step)-[:CONSUMES]->(:Variable)
+(:Step)-[:PRODUCES]->(:Variable)
+```
+
+**Open questions:**
+- **Branching/conditional steps.** BPMN territory — P-Plan doesn't model conditionals natively. Add a `:DECIDES_ON` edge, or leave branching as an agent-side concern the schema doesn't try to capture?
+- **Variable typing.** Free string, a controlled vocabulary, or a pointer to a `:Fact` triplet (so a step's input/output can be a structurally-checkable claim, not just a label)?
+- **Step granularity.** Is a `:Step` always atomic, or can protocols nest — P-Plan supports sub-plan composition (`p-plan:isSubPlanOfPlan`) natively, so this is "do we use that" more than "is it possible."
+- **Linkage to facts/observations.** Does a `:Protocol` carry `:EVIDENCE_FOR`-style backing — e.g., observations of successful runs consolidating into confidence that the protocol is correct? Or is it evidence-free by nature (a protocol is prescriptive, not a claim to be verified)?
+- **Versioning.** Protocols evolve as the codebase does. Supersession via a dedicated edge (old protocol points at its replacement), or replace-in-place with history lost?
+
+**What would unblock it:** the issue itself suggests the trigger — "at least one concrete protocol use case (e.g., the deploy runbook for mesial itself) drives the shape." Not a research task to resolve in the abstract; a real protocol to model first, then generalize from.
+
+### Issue #8 — anchor stability and re-anchoring spec
+
+**Why it exists.** The load-bearing risk for the entire memory layer, not a nice-to-have. `analyze_repository`/`ingest_documents` `DETACH DELETE`s and recreates `:Chunk` nodes on every re-run (`falkorstore.DeleteBySource` → `StoreChunks`) — FalkorDB assigns fresh internal IDs on create, so any `:MOTIVATES` edge pointing at the old chunk ID is silently dropped. An observation stays in the graph looking healthy, disconnected from the doc that grounded it, with nothing surfacing the disconnect. `ONBOARDING.md` §15 walks through this with the actual code. Every other memory feature (fact verification, `surface`, coverage metrics) silently assumes anchors survive re-ingest; today they don't.
+
+**Mechanism, already sketched** (not the open part):
+1. **Stable identity properties** on `:Chunk`: `content_hash` (whitespace-normalized, so trivial reformatting doesn't invalidate it), `breadcrumb_hash` (heading path), composite key `source_path + breadcrumb_hash + content_hash`.
+2. **Re-anchoring algorithm** — match new chunks to old by composite key (high confidence) → fall back to `source_path + content_hash` alone (catches renamed sections) → fall back to vector similarity over old/new embeddings plus shared `:DOCUMENTS` targets (lowest confidence) → surface anything unmappable as orphaned for review.
+3. A `reanchor(repo, changed_sources?) → ReanchorReport` primitive returning `remapped`/`ambiguous`/`orphaned`/`created_anew`, with `:MOTIVATES` edges replayed from old chunk to new.
+
+**Open questions — the actual research gap:**
+- **Confidence thresholds.** Below what score does a re-linked observation queue for human review via `propose_then_confirm` instead of auto-remapping? No default is proposed anywhere yet.
+- **`:CodeEntity` stable identity.** The equivalent problem for code, not just docs — today identity is `(name, path, src_start, src_end)`, which breaks on any line-shift edit. Proposed direction is `(name, path, signature_hash)`, but what exactly feeds the hash (parameter types? return type? just the signature text?) isn't decided.
+- **`last_distilled_at` carry-forward.** Added as a fix during PR review on this fork (see PR #5's commit `186489b`) but worth restating here as an open implementation detail: a successful remap must carry `Chunk.last_distilled_at` from the old node to the new one, or every reanchor makes freshly-verified chunks look unverified again.
+
+### Issue #9 — test and runtime trace ingestion (`:Test`, `:Failure`, `:EXERCISES`)
+
+**Why it exists.** Tests are executable documentation; a captured failure is a gold-standard episodic observation. Without this, two extremely high-frequency agent questions have no structural answer: *"what tests should I run after changing function F?"* (today: grep test directories for callers — slow, lossy) and *"where has this code failed before?"* (today: trawl CI logs or git history). With the schema below, both become graph traversals: `(:Function {name:F})<-[:EXERCISES]-(:Test)` and `(:Function {name:F})<-[:OBSERVED_IN]-(:Failure)<-[:MOTIVATES]-(:Observation)`.
+
+**Rough schema** (explicitly not final — full design pass needed):
+```
+:Test    {name, file_path, framework}
+:Failure {id, observed_at, error_text, stack_summary?}
+
+(:Test)-[:EXERCISES]->(:Function | :Method | :Class)
+(:Failure)-[:OBSERVED_IN]->(:Test)
+(:Observation)-[:MOTIVATES]->(:Failure)
+```
+
+**Open questions:**
+- **Granularity.** One `:Test` per test function, per `describe`/`context` block, or per file? Affects both graph size and how precise "what tests exercise this" answers can be.
+- **`EXERCISES` inference.** Static analysis (parse call graphs inside test bodies — cheap, some false negatives on indirection) vs. runtime instrumentation (precise, requires actually running tests with tracing) vs. both, with static as the cheap default and runtime as an opt-in precision upgrade.
+- **`:Failure` deduplication.** The same error recurring across 5 runs — one `:Failure` node with a `run_count` property, or five separate nodes forming a timeline? Affects whether "where has this failed before" reads as a count or a history.
+- **Lifecycle.** When does a `:Failure` age out — on resolution (the fix commit lands)? When git history drops the relevant commits entirely? Never, and let `hygiene_queue` surface old ones instead of deleting?
+- **Observation-linkage tension.** An agent's fix-observation should `:MOTIVATES` a `:Failure` — but `:Failure` describes something in the past, while the existing `(:Observation)-[:MOTIVATES]->(:Chunk)` semantic is present-tense ("this chunk's current content is grounded"). Does the same edge type stretch to cover both senses cleanly, or does this need its own edge?
+
+**Explicitly out of scope for the issue itself:** implementation, and any specific test-framework integration (Jest, Vitest, `go test`, pytest) — those come after the schema design, as per-framework adapters.
+
+### Deferred without a filed issue yet
+
+Named in `RATIONALE.md` §11 / `ARCHITECTURE.md`, not yet formalized as GitHub issues:
+
+- **Forward-chaining inference** over `:ENTAILS`/`:INSTANCE_OF`/`:SUBTYPE_OF` and reified `:Rule` nodes (`LIFECYCLE.md`'s `dlpfc` deep-reasoning tier, Tier 4). Deferred deliberately until fact density is high enough for derivations to mean anything — inferring over a sparse fact graph produces conclusions with no real support.
+- **Cross-repo / federated queries.** Would need either a query-fan-out layer across per-repo graphs, or a single global graph — the latter already rejected (`RATIONALE.md` decision 2: identifier collisions across projects, messy cleanup). No design started on the fan-out alternative.
+- **Multi-language analyzers** (Python, Go, etc.). Not actually blocked on a design question — the `Analyzer` interface (`internal/analyzer/analyzer.go`) is already language-agnostic by construction. Adding a language is "a grammar + symbol-extraction visitor + LSP wiring," per `RATIONALE.md` §11 — genuinely just unstarted work, not an open question.
 
 ## 5. Open PRs, issues, and branches — acute descriptions
 
