@@ -47,8 +47,13 @@ Env vars for `cmd/ingest`: `FALKOR_ADDR` (default `localhost:6381`), `EMBEDDING_
 Embedding model must be running separately:
 
 ```bash
-llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090
+make embed
 ```
+
+`make embed` looks for the GGUF at `models/Qwen3-Embedding-0.6B-Q8_0.gguf`
+(gitignored — drop your own copy there) by default; override `EMBED_MODEL` to
+point elsewhere. Missing file fails fast with a one-line error instead of a
+half-started server on 8090.
 
 No tests or CI configured yet.
 

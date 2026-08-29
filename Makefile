@@ -10,8 +10,14 @@ down:
 # Start the embedding server (runs in foreground).
 # --ctx-size 8192 handles long doc chunks (default is too small and crashes
 # the server on inputs above a few hundred tokens). Qwen3 supports up to 32k.
+#
+# EMBED_MODEL defaults to the repo-local (gitignored) models/ dir — drop your
+# own GGUF there, or override EMBED_MODEL to point anywhere else (e.g. a
+# shared copy from another checkout on your machine).
+EMBED_MODEL ?= models/Qwen3-Embedding-0.6B-Q8_0.gguf
 embed:
-	llama-server --embedding -m models/Qwen3-Embedding-0.6B-Q8_0.gguf --port 8090 --ctx-size 8192
+	@test -f "$(EMBED_MODEL)" || { echo "model file missing: $(EMBED_MODEL) — download Qwen3-Embedding-0.6B-Q8_0.gguf into models/, or set EMBED_MODEL=/path/to/your.gguf"; exit 1; }
+	llama-server --embedding -m $(EMBED_MODEL) --port 8090 --ctx-size 8192
 
 # Run the ingest MCP server in HTTP mode (for dev/testing)
 ingest:
