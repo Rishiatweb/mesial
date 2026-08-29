@@ -171,7 +171,7 @@ isLinkableBare("__init__")       // false — zero non-empty segments
 
 ## 9. The MCP surface today
 
-Four tools, all defined in `cmd/ingest/main.go`, all thin adapters over `internal/pipeline` — the MCP server and `h9s-cli` (dev harness) call the exact same functions and can never drift in behavior from each other.
+Nine tools, all defined in `cmd/ingest/main.go`, all thin adapters over `internal/pipeline` — the MCP server and `h9s-cli` (dev harness) call the exact same functions and can never drift in behavior from each other. The first four are the original, verified-working set; the last five (memory layer) were added recently and are implemented-but-unverified — see §10.
 
 | Tool | Input | Does |
 |---|---|---|
@@ -179,10 +179,15 @@ Four tools, all defined in `cmd/ingest/main.go`, all thin adapters over `interna
 | `ingest_documents` | `{paths[], repo?, strict?}` | Chunk + embed + store + per-source link; all paths must share one `.git` ancestor |
 | `search_documents` | `{query, k?, repo?, path?}` | KNN over `:Chunk.vector`; falls back to the global graph if neither `repo` nor `path` given |
 | `link_docs` | `{repo?, path?, strict?}` | Re-runs the linker over an existing graph; idempotent |
+| `add_observation` | `{text, repo?, path?, k?, motivates_chunk_id?, evidence_for_fact_ids?}` | Embeds, KNNs against existing observations, creates the node; optionally links `MOTIVATES`/`EVIDENCE_FOR` in the same call |
+| `create_fact` | `{repo?, path?, observation_id, subject, predicate, object}` | Atomic MERGE + `EVIDENCE_FOR`; the only path to creating a fact |
+| `link_evidence` | `{repo?, path?, observation_id, fact_ids}` | Retroactive `EVIDENCE_FOR` linking |
+| `search_observations` | `{query, k?, repo?, path?}` | KNN over `:Observation.vector` |
+| `search_facts` | `{subject?, predicate?, object?, limit?, repo?, path?}` | Structural triplet search |
 
-**Repo resolution — the same chain, three places.** `ingest_documents` and `link_docs` resolve the target graph: explicit `repo` argument wins; otherwise walk up from the input path looking for a `.git` directory and use its basename; otherwise **error** — no silent fallback. `search_documents` runs the identical chain but falls back to the global `H9S_GRAPH` (default `"h9s"`) instead of erroring.
+**Repo resolution — the same chain, most places.** Write tools (`ingest_documents`, `link_docs`) resolve the target graph: explicit `repo` argument wins; otherwise walk up from the input path looking for a `.git` directory and use its basename; otherwise **error** — no silent fallback. `search_documents` runs the identical chain but falls back to the global `H9S_GRAPH` (default `"h9s"`) instead of erroring. The five memory tools follow the *search* pattern even on writes (`add_observation`, `create_fact` included) — falling back to the global graph rather than erroring, since mesial's own design treats the global memory graph as a legitimate default home for cross-cutting observations, unlike per-repo docs.
 
-**Why search gets a fallback and writes don't:** silently writing a repo's docs into the global graph because an agent forgot to pass a path would be a nasty bug to track down — cross-contaminated data with no error pointing at the cause. Erroring forces intent on writes. Search is asymmetric on purpose: cross-cutting queries against the global graph are legitimately useful, and "searched the wrong graph" just means empty results — annoying, not corrupting.
+**Why search gets a fallback and doc-writes don't:** silently writing a repo's docs into the global graph because an agent forgot to pass a path would be a nasty bug to track down — cross-contaminated data with no error pointing at the cause. Erroring forces intent on doc writes. Search is asymmetric on purpose: cross-cutting queries against the global graph are legitimately useful, and "searched the wrong graph" just means empty results — annoying, not corrupting. Memory writes get the same asymmetry as search, deliberately, because unlike docs, memory doesn't always belong to one repo.
 
 ## 10. The memory layer
 
@@ -200,7 +205,7 @@ The hippocampus framing is literal: observations consolidate into facts via `:EV
 
 **What's actually implemented:** full CRUD, in Go, tested. `internal/falkorstore/memorystore.go` (544 lines) has the FalkorDB layer — `EnsureGraphMeta`, `AddObservation`, `AddFact` (MERGE on triplet), `LinkEvidenceFor`, `LinkMotivates`, `SearchObservations` (KNN), `SearchFacts` (structural), plus existence-checked edge writers that fail loudly instead of silently no-op'ing on a bad ID. `internal/pipeline/memory.go` wraps it into agent-shaped operations — notably `AddObservation`, which embeds the text, KNNs against *existing* observations before inserting the new one (so it never surfaces itself as its own neighbor), then collects and returns the facts those neighbors back.
 
-Try it today — CLI-only:
+Try it via the CLI:
 
 ```bash
 h9s-cli memory init --repo my-project
@@ -211,7 +216,9 @@ h9s-cli memory search-obs --repo my-project "token expiry"
 h9s-cli memory evidence --repo my-project --fact 3
 ```
 
-**What's not there yet — verified by reading the code, not assumed:** `cmd/ingest/main.go` registers exactly four MCP tools, and none touch the memory layer. Everything above — `add-obs`, `create-fact`, `search-obs`, all ten `memory` subcommands — is reachable only through direct CLI invocation of `h9s-cli`. An agent talking to mesial over MCP today cannot write or read a single observation or fact. The storage and pipeline layers are done; the door to reach them from an agent hasn't been built. This is the single most concrete, scoped, "pick this up and go" gap in the whole project — see [§16](#16-where-to-actually-start).
+**MCP exposure — added, not yet verified.** `cmd/ingest/main.go` now registers five memory tools alongside the original four: `add_observation`, `create_fact`, `link_evidence`, `search_observations`, `search_facts` (see `docs/ARCHITECTURE.md`'s MCP tool surface table). `add_observation` folds `link_motivates` entirely — an agent recording an observation almost always already knows the chunk it was reading, so that's one round-trip instead of two, plus an optional `evidence_for_fact_ids` to link `EVIDENCE_FOR` in the same call. `link_evidence` stays a separate tool for genuinely retroactive linking (the `propose_then_confirm` fact-generation flow, Tier 3).
+
+Caveat worth taking seriously: this was implemented and manually cross-checked against the real pipeline/falkorstore function signatures, but **not build- or runtime-verified** — no Go toolchain was available in the environment it was written in, so it's never been compiled, let alone run against a live FalkorDB + llama-server. Treat it as "should work, unproven" until someone runs `go build ./...` and exercises it for real.
 
 ## 11. Package map
 
@@ -224,7 +231,7 @@ h9s-cli memory evidence --repo my-project --fact 3
 | `internal/lspclient` | `typescript-language-server` subprocess wrapper. JSON-RPC framing, `initialize`, `didOpen`, `definition`, shutdown. |
 | `internal/doclinker` | Chunk-to-entity identifier scanner. Pure logic over the store. |
 | `internal/pipeline` | The composition layer. Everything `cmd/ingest` and `cmd/h9s-cli` call funnels through here — why the two front-ends can't drift. |
-| `cmd/ingest` | MCP server entrypoint. stdio or streamable-HTTP transport, four tools registered. |
+| `cmd/ingest` | MCP server entrypoint. stdio or streamable-HTTP transport, nine tools registered (4 original + 5 memory-layer, unverified). |
 | `cmd/h9s-cli` | Direct dev harness — same pipeline, no MCP round-trip. Fastest way to test a change. |
 | `cmd/chunker` | Standalone chunker CLI. Outputs JSON — useful for eyeballing how a doc will chunk before ingesting it for real. |
 
@@ -249,7 +256,7 @@ Condensed from `docs/RATIONALE.md`, which is worth reading in full — every ent
 
 - **Not an interpretive linker.** The doc-linker connects on surface identifier match, never on meaning. Connecting "the auth flow" to `AuthService` in prose that never says the class name is the agent's job, not mesial's.
 - **Not cross-repo.** Every repository is an island graph. A federated query layer across repos isn't built, and there's no plan to bolt one on without real demand driving the shape.
-- **Not (yet) a general-memory store an agent can reach.** See [§10](#10-the-memory-layer) — the schema exists, the door doesn't.
+- **A memory store an agent can reach, but an unproven one.** See [§10](#10-the-memory-layer) — the schema, storage, and MCP tools all exist now; the code has not been built or run against a live FalkorDB yet.
 - **Not a code-search engine.** Code entities are queried structurally, by name and traversal — never embedded. "Find code semantically similar to X" is a different kind of problem mesial hasn't taken on.
 
 ## 14. State of the world, honestly
@@ -270,7 +277,7 @@ Pulled directly from git history, open issues, and the open pull request — not
 | #8 | Anchor stability & re-anchoring spec | Design-only per the issue body; flagged as the **load-bearing risk** for the whole memory layer (see next section) |
 | #9 | `:Test`/`:Failure` ingestion | Design pass only — schema and ingestion strategy still open questions |
 
-**The real gap.** None of the three issues above are what's stopping a working engineer today. The memory layer having zero MCP exposure (§10) is. It's not filed as an issue anywhere — you only find it by reading `cmd/ingest/main.go` and counting tool registrations.
+**The gap that was here got closed, provisionally.** None of the three issues above were ever what was stopping a working engineer — the memory layer having zero MCP exposure was, and that's now fixed (§10): 5 new tools registered in `cmd/ingest/main.go`. "Provisionally" because it's unbuilt and unrun — the next real gap is verification, not implementation. Don't merge or rely on it without a `go build ./...` and a live smoke test first.
 
 **Physician, heal thyself.** `CLAUDE.md` — the file meant to orient an agent working in this repo — still says *"No tests or CI configured yet."* That was true when it was written; it's not true now: `internal/doclinker/linker_test.go` and `internal/falkorstore/memorystore_test.go` both exist, and the README already documents `go test ./...` as covering doclinker. Mesial's entire purpose is catching exactly this kind of drift — a doc that stops matching the code it describes, silently, with nothing flagging it. `CLAUDE.md` going stale relative to its own README is a small, low-stakes, genuinely fitting instance of the problem LIFECYCLE.md's `hygiene_queue` and `stale_doc_candidates` metric (§15) are designed to catch. Also a fine two-minute first PR if you want one that requires zero ramp-up.
 
@@ -338,7 +345,7 @@ If an agent skill follows this table mechanically, every commit cycle passes thr
 
 Ranked by how much you can get done before hitting a design decision that isn't yours to make yet:
 
-1. **Wire the memory layer into `cmd/ingest`.** Everything the MCP tools need already exists in `internal/pipeline/memory.go` — `AddObservation`, `CreateFactFromObservation`, `LinkObservationEvidence`, `SearchObservations`, `SearchFacts`. This is copying the pattern the four existing tools already use (thin `mcp.AddTool` adapter → pipeline call → format result), not inventing anything. Highest leverage-to-effort ratio in the repo right now, and it's Tier 1 work per LIFECYCLE.md's own prioritization. Still true on this fork even though LIFECYCLE.md itself is now merged here — merging the doc didn't wire the tools.
+1. **~~Wire the memory layer into `cmd/ingest`~~ — done, unverified.** Five tools now registered (`add_observation`, `create_fact`, `link_evidence`, `search_observations`, `search_facts`), following the exact `mcp.AddTool` pattern the original four use. What's still real work: **build it, run it against a live FalkorDB + llama-server, confirm the tool schemas round-trip correctly through an actual MCP client.** None of that happened yet — no Go toolchain was available when this was written. Treat the implementation as a draft that compiles by inspection, not by `go build`.
 2. **~~Review and merge PR #10~~ — done on this fork.** Fork PR #5 went through review, picked up two real fixes, and merged. Upstream's PR #10 is still open with the original (uncorrected) content, in case that's relevant to you.
 3. **Anchor stability (issue #8), once someone actually needs it.** The design sketch above is solid, but building `reanchor` before there's memory data worth protecting is building insurance for a house that doesn't exist yet. Do #1 first — once agents are writing real observations through MCP, the churn problem stops being theoretical and this jumps to the top.
 4. **Leave #6 and #9 alone for now.** Both issues say so themselves — "design only," deferred until a concrete use case exists. Implementing ahead of that isn't initiative, it's skipping a step the previous author deliberately built into the process.

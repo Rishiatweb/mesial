@@ -76,7 +76,7 @@ Deliberate non-goals, with reasoning in [`RATIONALE.md`](RATIONALE.md):
 
 - **Not an interpretive linker.** Connections are made by surface match — identifier names that appear in both a doc and the code graph. Connecting "the auth flow" prose to `AuthService` requires an agent's understanding, not the memory's. Mesial provides anchors; the agent does the bridging.
 - **Not cross-repo.** Each repository has its own graph. Cross-repo queries would need a federated layer; not built.
-- **Not (yet) a general-memory store.** The schema for the `memory` graph (facts, observations, protocols) is designed but unimplemented; agent-orchestrated distillation tooling is deferred until the data design is fully ratified. See [`ARCHITECTURE.md`](ARCHITECTURE.md#memory-facts-observations-protocols-planned).
+- **A general-memory store, reachable but unproven.** The `memory` graph (facts, observations) has schema, storage, and MCP tools now — `add_observation`, `create_fact`, `link_evidence`, `search_observations`, `search_facts`. `:Protocol` is still schema-only (see issue #6). Agent-orchestrated multi-turn distillation (`propose_then_confirm` sessions) is still deferred. See [`ARCHITECTURE.md`](ARCHITECTURE.md#memory-facts-observations-protocols-planned) and `docs/IMPLEMENTATION.md` §1.
 - **Not a code-search engine.** Code entities aren't embedded — they're queried structurally. "Find code semantically similar to X" is a different shape of problem.
 
 ## Where to go next
