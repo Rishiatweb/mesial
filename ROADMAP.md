@@ -1,5 +1,7 @@
 # Mesial Roadmap
 
+For the granular, file-level breakdown of what's shipped vs. wired-to-MCP vs. CLI-only, plus the three pathways (implementation / productionizing / research) and a live PR & issue tracker, see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md). This file stays the concise high-level status; that one is the detailed companion.
+
 ## What works today
 
 ### Code + docs per-repo graphs
@@ -27,7 +29,8 @@
 - Two-binary architecture: `cmd/ingest` (MCP server) and `cmd/h9s-cli` (direct dev harness), both adapters over `internal/pipeline`
 
 ### Documentation
-- `docs/DESIGN.md` (high-level), `docs/ARCHITECTURE.md` (engineering view), `docs/RATIONALE.md` (decision-by-decision)
+- `docs/ONBOARDING.md` (guided field-guide), `docs/DESIGN.md` (high-level), `docs/ARCHITECTURE.md` (engineering view), `docs/RATIONALE.md` (decision-by-decision), `docs/IMPLEMENTATION.md` (build log + implementation/productionizing/research pathways, live PR & issue tracker)
+- `docs/LIFECYCLE.md` (bootstrap, distillation, online use) — merged into this fork via PR #5; still unmerged upstream at `mknw/mesial` (PR #10)
 
 ## Next
 
