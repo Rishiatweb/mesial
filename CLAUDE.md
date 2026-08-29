@@ -50,9 +50,10 @@ Embedding model must be running separately:
 make embed
 ```
 
-The GGUF itself lives in the hames-playground checkout
-(`~/Code/kg-agent/models/`), which owns the canonical `make embed`; this repo
-keeps no second copy. `make embed` here points at that path via `EMBED_MODEL`.
+`make embed` looks for the GGUF at `models/Qwen3-Embedding-0.6B-Q8_0.gguf`
+(gitignored — drop your own copy there) by default; override `EMBED_MODEL` to
+point elsewhere. Missing file fails fast with a one-line error instead of a
+half-started server on 8090.
 
 No tests or CI configured yet.
 

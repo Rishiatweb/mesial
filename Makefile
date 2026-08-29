@@ -11,12 +11,12 @@ down:
 # --ctx-size 8192 handles long doc chunks (default is too small and crashes
 # the server on inputs above a few hundred tokens). Qwen3 supports up to 32k.
 #
-# The GGUF now lives in the hames-playground checkout (its Makefile owns the
-# canonical `make embed`); this repo no longer keeps a second copy. Override
-# EMBED_MODEL if yours is elsewhere.
-EMBED_MODEL ?= /Users/mknw/Code/kg-agent/models/Qwen3-Embedding-0.6B-Q8_0.gguf
+# EMBED_MODEL defaults to the repo-local (gitignored) models/ dir — drop your
+# own GGUF there, or override EMBED_MODEL to point anywhere else (e.g. a
+# shared copy from another checkout on your machine).
+EMBED_MODEL ?= models/Qwen3-Embedding-0.6B-Q8_0.gguf
 embed:
-	@test -f "$(EMBED_MODEL)" || { echo "model file missing: $(EMBED_MODEL) — see hames-playground models/README.md"; exit 1; }
+	@test -f "$(EMBED_MODEL)" || { echo "model file missing: $(EMBED_MODEL) — download Qwen3-Embedding-0.6B-Q8_0.gguf into models/, or set EMBED_MODEL=/path/to/your.gguf"; exit 1; }
 	llama-server --embedding -m $(EMBED_MODEL) --port 8090 --ctx-size 8192
 
 # Run the ingest MCP server in HTTP mode (for dev/testing)
