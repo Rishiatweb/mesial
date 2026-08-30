@@ -54,6 +54,11 @@ The agent then sees these tools:
 | `ingest_documents` | Add markdown files to a repo's graph |
 | `search_documents` | Semantic search by query (with optional repo scope) |
 | `link_docs` | Re-run the doc-to-code linker on an existing graph |
+| `add_observation` | Record an episodic observation; optionally link `MOTIVATES`/`EVIDENCE_FOR` in the same call |
+| `create_fact` | MERGE a `:Fact` triplet, backed by an existing observation |
+| `link_evidence` | Retroactively link an observation to existing facts |
+| `search_observations` | KNN search over observations |
+| `search_facts` | Structural search over facts by triplet fields |
 | `query_graph` / `query_graph_readonly` | Direct Cypher (via the gateway) |
 
 ## Common tasks

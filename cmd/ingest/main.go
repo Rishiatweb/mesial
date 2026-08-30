@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -245,6 +246,282 @@ func main() {
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Asserted %d DOCUMENTS edges in graph %q.", edges, repoName)}},
+		}, nil, nil
+	})
+
+	// --- add_observation ---
+	//
+	// Deep by design: embeds the text, KNN-searches existing observations,
+	// creates the node, and optionally links MOTIVATES (to a chunk) and/or
+	// EVIDENCE_FOR (to existing facts) — all in one call. Folds what would
+	// otherwise be mandatory follow-up calls (link_motivates, link_evidence)
+	// into the write path, since an agent recording an observation almost
+	// always already knows the chunk it was reading, if any. link_evidence
+	// stays as its own tool below for the genuinely different case of
+	// retroactively linking an older observation to a newly confirmed fact.
+
+	type AddObservationInput struct {
+		Text               string  `json:"text"                            jsonschema:"Observation text — a sentence, rarely two, describing what was learned."`
+		Repo               string  `json:"repo,omitempty"                  jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from .git ancestor of Path; falls back to the global memory graph (H9S_GRAPH) if neither is given."`
+		Path               string  `json:"path,omitempty"                  jsonschema:"Optional path inside a repo. Used for .git walk-up if Repo is not given."`
+		K                  int     `json:"k,omitempty"                     jsonschema:"Number of nearest existing observations to consult for similar_facts. Defaults to 5."`
+		MotivatesChunkID   int64   `json:"motivates_chunk_id,omitempty"    jsonschema:"Optional chunk ID this observation motivates. Links (:Observation)-[:MOTIVATES]->(:Chunk) in the same call."`
+		EvidenceForFactIDs []int64 `json:"evidence_for_fact_ids,omitempty" jsonschema:"Optional existing fact IDs this observation backs. Links (:Observation)-[:EVIDENCE_FOR]->(:Fact) for each, in the same call."`
+	}
+
+	type AddObservationOutput struct {
+		ObservationID      int64                  `json:"observation_id"`
+		SimilarFacts       []pipeline.SimilarFact `json:"similar_facts"`
+		MotivatesLinked    bool                   `json:"motivates_linked"`
+		EvidenceLinkedIDs  []int64                `json:"evidence_linked_ids"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "add_observation",
+		Description: "Record an episodic observation in the memory layer. Embeds the text, KNN-searches existing observations, and returns similar facts the agent can decide to link. Optionally links MOTIVATES and/or EVIDENCE_FOR in the same call.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input AddObservationInput) (*mcp.CallToolResult, any, error) {
+		if strings.TrimSpace(input.Text) == "" {
+			return nil, nil, fmt.Errorf("text is required")
+		}
+
+		memStore := store
+		memGraph := graphName
+		if input.Repo != "" || input.Path != "" {
+			name, err := pipeline.ResolveRepoGraphName(input.Repo, input.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving repo: %w", err)
+			}
+			repoStore, err := falkorstore.NewStore(falkorAddr, name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", name, err)
+			}
+			defer repoStore.Close()
+			memStore = repoStore
+			memGraph = name
+		}
+
+		if err := pipeline.EnsureMemoryReady(ctx, memStore, pipeline.MemoryGraphKind); err != nil {
+			return nil, nil, fmt.Errorf("ensuring memory layer ready on graph %q: %w", memGraph, err)
+		}
+
+		res, err := pipeline.AddObservation(ctx, memStore, embedder, input.Text, input.K)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		out := AddObservationOutput{
+			ObservationID: res.ObservationID,
+			SimilarFacts:  res.SimilarFacts,
+		}
+
+		if input.MotivatesChunkID > 0 {
+			if err := pipeline.LinkObservationMotivatesChunk(ctx, memStore, res.ObservationID, input.MotivatesChunkID); err != nil {
+				return nil, nil, fmt.Errorf("observation %d created, but linking MOTIVATES to chunk %d failed: %w", res.ObservationID, input.MotivatesChunkID, err)
+			}
+			out.MotivatesLinked = true
+		}
+
+		if len(input.EvidenceForFactIDs) > 0 {
+			if err := pipeline.LinkObservationEvidence(ctx, memStore, res.ObservationID, input.EvidenceForFactIDs); err != nil {
+				return nil, nil, fmt.Errorf("observation %d created, but linking EVIDENCE_FOR failed: %w", res.ObservationID, err)
+			}
+			out.EvidenceLinkedIDs = input.EvidenceForFactIDs
+		}
+
+		body, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("encoding result: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
+		}, nil, nil
+	})
+
+	// --- create_fact ---
+
+	type CreateFactInput struct {
+		Repo          string `json:"repo,omitempty"        jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from .git ancestor of Path; falls back to the global memory graph if neither is given."`
+		Path          string `json:"path,omitempty"        jsonschema:"Optional path inside a repo. Used for .git walk-up if Repo is not given."`
+		ObservationID int64  `json:"observation_id"        jsonschema:"ID of the backing :Observation (required). Every fact must have at least one — this is the only way to create one."`
+		Subject       string `json:"subject"                jsonschema:"Fact subject."`
+		Predicate     string `json:"predicate"              jsonschema:"Fact predicate. Kernel (inference-actionable): is_a, subtype_of, part_of, equivalent_to, incompatible_with, causes, requires. Open-set predicates are accepted but inert to the future inference engine."`
+		Object        string `json:"object"                 jsonschema:"Fact object."`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_fact",
+		Description: "MERGE a :Fact triplet and link it to a backing :Observation via EVIDENCE_FOR, atomically. The only path to creating a fact — enforces the no-orphan-facts invariant.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input CreateFactInput) (*mcp.CallToolResult, any, error) {
+		if input.ObservationID <= 0 {
+			return nil, nil, fmt.Errorf("observation_id is required")
+		}
+		if input.Subject == "" || input.Predicate == "" || input.Object == "" {
+			return nil, nil, fmt.Errorf("subject, predicate, and object are all required")
+		}
+
+		memStore := store
+		memGraph := graphName
+		if input.Repo != "" || input.Path != "" {
+			name, err := pipeline.ResolveRepoGraphName(input.Repo, input.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving repo: %w", err)
+			}
+			repoStore, err := falkorstore.NewStore(falkorAddr, name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", name, err)
+			}
+			defer repoStore.Close()
+			memStore = repoStore
+			memGraph = name
+		}
+
+		if err := pipeline.EnsureMemoryReady(ctx, memStore, pipeline.MemoryGraphKind); err != nil {
+			return nil, nil, fmt.Errorf("ensuring memory layer ready on graph %q: %w", memGraph, err)
+		}
+
+		factID, err := pipeline.CreateFactFromObservation(ctx, memStore, input.ObservationID, input.Subject, input.Predicate, input.Object)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		summary := fmt.Sprintf("Fact %d: (%s, %s, %s) — backed by observation %d, graph %q.",
+			factID, input.Subject, input.Predicate, input.Object, input.ObservationID, memGraph)
+		if !falkorstore.MemoryPredicateKernel[input.Predicate] {
+			summary += fmt.Sprintf(" Note: predicate %q is open-set — accepted but inert to the future inference engine.", input.Predicate)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
+		}, nil, nil
+	})
+
+	// --- link_evidence ---
+	//
+	// Kept as its own tool: retroactively linking an older observation to a
+	// newly confirmed fact is a genuinely different case from linking at
+	// write time (which add_observation already covers) — a real second
+	// adapter, not a convenience duplicate.
+
+	type LinkEvidenceInput struct {
+		Repo          string  `json:"repo,omitempty"        jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from .git ancestor of Path; falls back to the global memory graph if neither is given."`
+		Path          string  `json:"path,omitempty"        jsonschema:"Optional path inside a repo. Used for .git walk-up if Repo is not given."`
+		ObservationID int64   `json:"observation_id"        jsonschema:"Observation ID (required)."`
+		FactIDs       []int64 `json:"fact_ids"              jsonschema:"Existing fact IDs to link as evidence (required, non-empty)."`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "link_evidence",
+		Description: "MERGE EVIDENCE_FOR edges from an existing observation to one or more existing facts. For retroactive linking; add_observation already links evidence supplied at write time.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input LinkEvidenceInput) (*mcp.CallToolResult, any, error) {
+		if input.ObservationID <= 0 {
+			return nil, nil, fmt.Errorf("observation_id is required")
+		}
+		if len(input.FactIDs) == 0 {
+			return nil, nil, fmt.Errorf("fact_ids is required")
+		}
+
+		memStore := store
+		memGraph := graphName
+		if input.Repo != "" || input.Path != "" {
+			name, err := pipeline.ResolveRepoGraphName(input.Repo, input.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving repo: %w", err)
+			}
+			repoStore, err := falkorstore.NewStore(falkorAddr, name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", name, err)
+			}
+			defer repoStore.Close()
+			memStore = repoStore
+			memGraph = name
+		}
+
+		if err := pipeline.LinkObservationEvidence(ctx, memStore, input.ObservationID, input.FactIDs); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Linked observation %d to %d fact(s) via EVIDENCE_FOR, graph %q.", input.ObservationID, len(input.FactIDs), memGraph)}},
+		}, nil, nil
+	})
+
+	// --- search_observations ---
+
+	type SearchObservationsInput struct {
+		Query string `json:"query"          jsonschema:"Natural language query to search for in the observation store."`
+		K     int    `json:"k,omitempty"    jsonschema:"Number of results to return. Defaults to 5 if omitted."`
+		Repo  string `json:"repo,omitempty" jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from .git ancestor of Path; falls back to the global memory graph if neither is given."`
+		Path  string `json:"path,omitempty" jsonschema:"Optional path inside a repo. Used for .git walk-up if Repo is not given."`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search_observations",
+		Description: "KNN search over the memory layer's observations. Returns hits with cosine distance.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input SearchObservationsInput) (*mcp.CallToolResult, any, error) {
+		memStore := store
+		if input.Repo != "" || input.Path != "" {
+			name, err := pipeline.ResolveRepoGraphName(input.Repo, input.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving repo: %w", err)
+			}
+			repoStore, err := falkorstore.NewStore(falkorAddr, name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", name, err)
+			}
+			defer repoStore.Close()
+			memStore = repoStore
+		}
+
+		hits, err := pipeline.SearchObservations(ctx, memStore, embedder, input.Query, input.K)
+		if err != nil {
+			return nil, nil, err
+		}
+		body, err := json.MarshalIndent(hits, "", "  ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("encoding result: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
+		}, nil, nil
+	})
+
+	// --- search_facts ---
+
+	type SearchFactsInput struct {
+		Subject   string `json:"subject,omitempty"   jsonschema:"Exact subject filter (empty = wildcard)."`
+		Predicate string `json:"predicate,omitempty" jsonschema:"Exact predicate filter (empty = wildcard)."`
+		Object    string `json:"object,omitempty"    jsonschema:"Exact object filter (empty = wildcard)."`
+		Limit     int    `json:"limit,omitempty"     jsonschema:"Max rows. Defaults to 50."`
+		Repo      string `json:"repo,omitempty"      jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from .git ancestor of Path; falls back to the global memory graph if neither is given."`
+		Path      string `json:"path,omitempty"      jsonschema:"Optional path inside a repo. Used for .git walk-up if Repo is not given."`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search_facts",
+		Description: "Structural search over the memory layer's facts (subject/predicate/object filters).",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input SearchFactsInput) (*mcp.CallToolResult, any, error) {
+		memStore := store
+		if input.Repo != "" || input.Path != "" {
+			name, err := pipeline.ResolveRepoGraphName(input.Repo, input.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving repo: %w", err)
+			}
+			repoStore, err := falkorstore.NewStore(falkorAddr, name)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to FalkorDB for graph %q: %w", name, err)
+			}
+			defer repoStore.Close()
+			memStore = repoStore
+		}
+
+		rows, err := pipeline.SearchFacts(ctx, memStore, input.Subject, input.Predicate, input.Object, input.Limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		body, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return nil, nil, fmt.Errorf("encoding result: %w", err)
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
 		}, nil, nil
 	})
 

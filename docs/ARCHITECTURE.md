@@ -381,6 +381,11 @@ Defined in `cmd/ingest/main.go`. Inputs are Go structs with `jsonschema` tags; t
 | `ingest_documents` | `{paths, repo?, strict?}` | Chunk + embed + store + per-source link. Resolves repo from explicit `repo` or `.git` walk-up of `paths[0]`. All paths must share the same repo. |
 | `search_documents` | `{query, k?, repo?, path?}` | Embed query, KNN over `:Chunk.vector`. Targets per-repo graph if `repo` or `path` given; falls back to global `H9S_GRAPH`. |
 | `link_docs` | `{repo?, path?, strict?}` | Re-runs `LinkRepo` over an existing per-repo graph. Idempotent. |
+| `add_observation` | `{text, repo?, path?, k?, motivates_chunk_id?, evidence_for_fact_ids?}` | Embeds, KNN-searches existing observations, creates the `:Observation`, and optionally links `MOTIVATES`/`EVIDENCE_FOR` in the same call. Repo resolution falls back to the global memory graph (unlike the write tools above, which error). |
+| `create_fact` | `{repo?, path?, observation_id, subject, predicate, object}` | MERGEs the `:Fact` triplet and links `EVIDENCE_FOR` to `observation_id` atomically. The only path to creating a fact. |
+| `link_evidence` | `{repo?, path?, observation_id, fact_ids}` | MERGEs `EVIDENCE_FOR` edges retroactively — for linking an existing observation to facts after the fact, not at write time. |
+| `search_observations` | `{query, k?, repo?, path?}` | KNN over `:Observation.vector`. |
+| `search_facts` | `{subject?, predicate?, object?, limit?, repo?, path?}` | Structural search over `:Fact` by triplet fields. |
 
 ## Configuration
 
