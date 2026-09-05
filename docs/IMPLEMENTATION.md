@@ -68,9 +68,13 @@ Every single `analyze_repository` call spawns a fresh `typescript-language-serve
 
 Renaming a `.md` or source file leaves the old `:File` node behind, orphaned — no chunks or entities point at it anymore, but it's never deleted. Harmless at small scale (a few stray nodes), a real accumulating-cruft problem for a repo with meaningful churn over time. Fix needs a decision first, not just code: how do you *detect* a rename vs. a delete-and-unrelated-create? (Same question issue #8 is already working through for `:CodeEntity` renames via `signature_hash` matching — this is plausibly the same mechanism applied to `:File`, not a separate design.)
 
+### Batch `DOCUMENTS` edge writes
+
+`internal/doclinker.link()` issues one synchronous `ConnectEntities` Cypher round-trip per matched `(chunk, entity)` pair — no batching, same one-row-per-query pattern already flagged for `StoreChunks` above. Benchmarked the matching logic itself (`internal/doclinker/linker_bench_test.go`) to find out whether this or raw CPU cost is the real scaling limit: it's the round-trips. The matching loop (regex candidate extraction + map lookup) scales ~linearly with total chunk content and is nearly independent of registered entity-name count — a 100× increase in chunks moved runtime ~90×, a 1000× increase in names moved it only ~1.5×. See the corrected entry in `RATIONALE.md` §11 (previously described this as an `O(chunks × names)` CPU concern, which the benchmark data doesn't support). On a real repo with many identifier mentions, wall-clock cost is dominated by N sequential network round-trips to FalkorDB, not by CPU time in the matcher. Fix: batch the `DOCUMENTS` edges from one `link()` call into a single multi-statement Cypher write (FalkorDB supports this, same mechanism proposed for `StoreChunks`), rather than optimizing the matching algorithm — that isn't where the cost is.
+
 ### Health metrics + evaluation hook
 
-`LIFECYCLE.md`'s health-metrics table (`documented_entity_ratio`, `chunk_anchor_stability_rate`, `facts_with_valid_evidence`, `stale_doc_candidates`, `chunks_without_observations`, ...) and its proposed `mesial/eval/` fixture directory (`golden_surface_queries/`, `golden_impact_queries/`, `golden_reanchor_cases/`, ...) are both fully specified in the doc — nothing to design here, only to build. This is the one productionizing item that's a genuine *prerequisite* for the others rather than independent: you can't safely tune the clustering algorithm, the linker's precision/recall balance, or `reanchor`'s confidence thresholds without a regression harness telling you whether a change made things better or worse. Every other item on this list is optional polish; this one is what keeps future changes from being vibes-driven.
+`LIFECYCLE.md`'s health-metrics table (`documented_entity_ratio`, `chunk_anchor_stability_rate`, `facts_with_valid_evidence`, `stale_doc_candidates`, `chunks_without_observations`, ...) is fully specified — nothing to design, only to build. Its proposed `mesial/eval/` fixture directory is a different story: every category it names (`golden_surface_queries/`, `golden_impact_queries/`, `golden_reanchor_cases/`, `golden_stale_doc_cases/`, `golden_contradictions/`) targets a primitive that doesn't exist yet (`surface`, `impact`, `reanchor`, `verify`) — none of the five proposed categories can actually be populated or run against current code. That's not a criticism of the design (aspirational fixtures for planned primitives are reasonable to write down), just a correction to "nothing to design here, only to build": the *shape* is designed, but there's no eval harness runnable against what's shipped today. The nearer-term, actually-buildable version is a golden-case harness for the linker itself (the one thing in this list with real matching behavior to regress-test) — fixture repos with known expected `DOCUMENTS` edges, asserted after `link_docs`. Health metrics + evaluation hook remain a genuine *prerequisite* for safely tuning the clustering algorithm, the linker's precision/recall balance, or `reanchor`'s confidence thresholds — this item just now distinguishes "buildable now" (linker golden cases, health metrics on shipped primitives) from "buildable once Tier 1/2 primitives exist" (the other four fixture categories).
 
 ## 4. Pathway: Research — open design questions
 
@@ -141,13 +145,20 @@ Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boun
 
 **Explicitly out of scope for the issue itself:** implementation, and any specific test-framework integration (Jest, Vitest, `go test`, pytest) — those come after the schema design, as per-framework adapters.
 
-### Deferred without a filed issue yet
+### Issue #10 (this fork) — cross-repo / federated query design
 
-Named in `RATIONALE.md` §11 / `ARCHITECTURE.md`, not yet formalized as GitHub issues:
+Named in `RATIONALE.md` §11 and `DESIGN.md`'s "What it isn't" for a long time without ever being tracked as its own issue — now filed. Real design questions: fan-out shape (independent per-graph queries vs. actual cross-graph joins), repo discovery (how a caller knows which graphs to query), cross-graph result ranking (merging independently-scored vector results from N graphs isn't a solved problem here), and identity collisions (two repos' `User` classes aren't the same entity). Per-repo isolation itself (`RATIONALE.md` decision 2) is correct and shouldn't be undone — this is about what sits on top of it, not replacing it. This is also the most direct answer to "isn't this just single-repo graph RAG": the realistic target user works across several repos, and there's no query path across them today.
+
+### Issue #11 (this fork) — doc-linker recall/precision, unmeasured since the original sample
+
+The linker's justification (`RATIONALE.md` decision 6) rests entirely on one historical claim — "backtick-only would miss ~80% of references," sampled once against an external repo (`kg-agent`), never repeated, never measured against this fork's own changes since. Whether the mechanical-only linker (`RATIONALE.md` decision 10's whole boundary argument) actually captures most of the real value, or is quietly missing the majority of what an interpretive pass would catch, is unknown. Not fixable by more synthetic benchmarking — `internal/doclinker/linker_bench_test.go` (added this pass) proves scaling behavior, explicitly not recall; recall needs a labeled real corpus, and mesial can't dogfood its own docs against its own linker (analyzer is TypeScript-only, mesial itself is Go). Needs an external TypeScript repo with hand-labeled ground truth.
+
+### Deferred without a filed issue
+
+Named in `RATIONALE.md` §11, genuinely just unstarted work rather than an open design question:
 
 - **Forward-chaining inference** over `:ENTAILS`/`:INSTANCE_OF`/`:SUBTYPE_OF` and reified `:Rule` nodes (`LIFECYCLE.md`'s `dlpfc` deep-reasoning tier, Tier 4). Deferred deliberately until fact density is high enough for derivations to mean anything — inferring over a sparse fact graph produces conclusions with no real support.
-- **Cross-repo / federated queries.** Would need either a query-fan-out layer across per-repo graphs, or a single global graph — the latter already rejected (`RATIONALE.md` decision 2: identifier collisions across projects, messy cleanup). No design started on the fan-out alternative.
-- **Multi-language analyzers** (Python, Go, etc.). Not actually blocked on a design question — the `Analyzer` interface (`internal/analyzer/analyzer.go`) is already language-agnostic by construction. Adding a language is "a grammar + symbol-extraction visitor + LSP wiring," per `RATIONALE.md` §11 — genuinely just unstarted work, not an open question.
+- **Multi-language analyzers** (Python, Go, etc.). Not blocked on a design question — the `Analyzer` interface (`internal/analyzer/analyzer.go`) is already language-agnostic by construction. Adding a language is "a grammar + symbol-extraction visitor + LSP wiring," per `RATIONALE.md` §11.
 
 ## 5. Open PRs, issues, and branches — acute descriptions
 
@@ -170,13 +181,20 @@ Named in `RATIONALE.md` §11 / `ARCHITECTURE.md`, not yet formalized as GitHub i
 
 ### Fork status (`Rishiatweb/mesial`) — where this repo has diverged from the table above
 
-| Fork # | Mirrors upstream | State on this fork | Divergence |
+All work in this fork happens here, never against `mknw/mesial` directly.
+
+| Fork # | Mirrors upstream | State | What it is |
 |---|---|---|---|
-| PR #5 | #10 (`feat/memory-mcp`) | **merged** | Went through an actual review pass on this fork: found a tiering overstatement in LIFECYCLE.md's closing summary and a missing `last_distilled_at` carry-forward rule in `reanchor`. Both fixed (commit `186489b`) before merging. `docs/LIFECYCLE.md` on this fork's `main` is that corrected version — upstream #10 still carries the original text. |
-| PR #6 | n/a (fork-only) | open | This doc + `ONBOARDING.md` + README/ROADMAP/DESIGN cross-reference fixes. |
+| PR #5 | #10 (`feat/memory-mcp`) | merged | `docs/LIFECYCLE.md`, corrected: a real review pass on this fork found a tiering overstatement in the closing summary and a missing `last_distilled_at` carry-forward rule in `reanchor`, both fixed (commit `186489b`) before merging. This fork's `main` carries the corrected text; upstream #10 still has the original. |
+| PR #6 | n/a (fork-only) | merged | `ONBOARDING.md` + this doc's first version + README/ROADMAP/DESIGN cross-reference fixes. |
+| PR #7 | n/a (fork-only) | merged | Pulled in upstream's `de6cb3b` (portable `EMBED_MODEL` default) and fixed the regression it shipped with — the default pointed at the original author's own machine path and an external repo nobody else has. |
+| PR #8 | n/a (fork-only) | merged | Expanded this doc's Productionizing and Research sections from bullet lists into full context per item. |
+| PR #9 | n/a (fork-only) | merged | The memory-layer MCP tools (§1/§2 above) — implemented, then genuinely build/test/live-verified against a real FalkorDB + llama-server + MCP client, including the `motivates_chunk_id` and LSP-hang investigations. |
 | Issue #2 | #6 | open | `:Protocol` schema — unchanged from upstream. |
 | Issue #3 | #8 | open | Anchor stability — unchanged from upstream. |
 | Issue #4 | #9 | open | `:Test`/`:Failure` ingestion — unchanged from upstream. |
+| Issue #10 | n/a (fork-only) | open | Cross-repo / federated query design — never had a filed issue anywhere before this fork. |
+| Issue #11 | n/a (fork-only) | open | Doc-linker recall/precision measurement — the linker's justifying claim (`RATIONALE.md` decision 6) was sampled once, years ago, against an external repo, never repeated. |
 | Issue #1 | #1 | closed | Mirrors upstream's closed state. |
 
 Upstream issues #6/#8/#9 (mirrored as fork #2/#3/#4) are unaffected by any of this — same open design questions either way, this fork just has its own copies to track against.
