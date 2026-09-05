@@ -35,7 +35,7 @@ Ordered by dependency, not just priority — later items build on earlier ones.
 1. **~~Expose the memory layer via MCP~~ — done, and verified live.** `add_observation`, `create_fact`, `link_evidence`, `search_observations`, `search_facts` are registered in `cmd/ingest/main.go`, built clean, and confirmed working end-to-end against a real FalkorDB + llama-server + an actual MCP `tools/call` round-trip (§1 has the detail). This was LIFECYCLE.md's Tier 1 item "`add_observation` runtime capture" and the one Tier 1 item with nothing else blocking it — now the first Tier 1 item actually closed out.
 2. **`surface(query|path, depth) → context_subgraph`.** The most-called primitive per LIFECYCLE.md — semantic search over chunks/observations, then graph traversal to assemble a context bundle. MVP response shape is already spec'd (versioned JSON: `chunks[]`, `entities[]`, `observations[]`, `confidence{}`) — see LIFECYCLE.md §"surface response shape."
 3. **`impact(entity, kinds[]) → dependent_set`.** Edge-traversal-as-impact — reduces "what depends on X?" to a graph query over existing `:CALLS`/`:DOCUMENTS`/`:EVIDENCE_FOR` edges. No new storage needed, purely a read-side MCP tool over data already being written.
-4. **Stable identity + `reanchor`.** Blocked on issue #8's design landing first (see §4 below) — this is where "Implementation" and "Research" pathways meet. Once the identity scheme (`content_hash` + `breadcrumb_hash`) is decided, implementation is: add the two hash properties to `:Chunk` on write, then build the match-fallback-orphan algorithm LIFECYCLE.md sketches.
+4. **Stable identity — decided and being built now (Increment 1); `reanchor` itself continues as Increment 2.** The identity scheme is resolved: `:Chunk` gets `anchor_id` (`source + breadcrumb`, assigned once) and `content_hash`; `ingest_documents`/`analyze_repository` resolve against these instead of delete-and-recreate, so `:MOTIVATES` edges survive ordinary edits. `:CodeEntity`'s MERGE key gains `parent_name` (fixes the line-shift fragility named in issue #3/#8). See `docs/DESIGN.md`'s stable-identity note and `docs/ARCHITECTURE.md`'s data model for the shipped shape. The standalone `reanchor` MCP tool, `impact`, and `surface` are written up as a continuation plan in `docs/TIER1_CONTINUATION.md` rather than built in this increment — issue #3/#8's remaining open items (confidence thresholds for the vector-similarity fallback, exact `signature_hash` inputs) belong there, not here.
 5. **`hygiene_queue(kind) → items[]`.** Time-driven maintenance queues — depends on the health metrics in §3 below existing to query against.
 6. **`verify` (5 scopes: logical, structural, evidence, anchor, coverage).** Anchor and structural scopes are buildable now (pure Cypher against existing edges); evidence and logical scopes want an LLM-assisted check and are naturally later.
 7. **Fact-generation flow, `:Protocol` ingestion, `:Test`/`:Failure` ingestion.** Tier 3 — the last two are explicitly gated on issues #6 and #9 being ratified first (§4).
@@ -106,17 +106,13 @@ Framed the way `RATIONALE.md` §11 frames deferred work: not a todo list, a boun
 
 ### Issue #8 — anchor stability and re-anchoring spec
 
-**Why it exists.** The load-bearing risk for the entire memory layer, not a nice-to-have. `analyze_repository`/`ingest_documents` `DETACH DELETE`s and recreates `:Chunk` nodes on every re-run (`falkorstore.DeleteBySource` → `StoreChunks`) — FalkorDB assigns fresh internal IDs on create, so any `:MOTIVATES` edge pointing at the old chunk ID is silently dropped. An observation stays in the graph looking healthy, disconnected from the doc that grounded it, with nothing surfacing the disconnect. `ONBOARDING.md` §15 walks through this with the actual code. Every other memory feature (fact verification, `surface`, coverage metrics) silently assumes anchors survive re-ingest; today they don't.
+**Why it exists.** The load-bearing risk for the entire memory layer, not a nice-to-have. `analyze_repository`/`ingest_documents` used to `DETACH DELETE` and recreate `:Chunk` nodes on every re-run — FalkorDB assigns fresh internal IDs on create, so any `:MOTIVATES` edge pointing at the old chunk ID was silently dropped. `ONBOARDING.md` §15 walks through this with the actual (now historical) code.
 
-**Mechanism, already sketched** (not the open part):
-1. **Stable identity properties** on `:Chunk`: `content_hash` (whitespace-normalized, so trivial reformatting doesn't invalidate it), `breadcrumb_hash` (heading path), composite key `source_path + breadcrumb_hash + content_hash`.
-2. **Re-anchoring algorithm** — match new chunks to old by composite key (high confidence) → fall back to `source_path + content_hash` alone (catches renamed sections) → fall back to vector similarity over old/new embeddings plus shared `:DOCUMENTS` targets (lowest confidence) → surface anything unmappable as orphaned for review.
-3. A `reanchor(repo, changed_sources?) → ReanchorReport` primitive returning `remapped`/`ambiguous`/`orphaned`/`created_anew`, with `:MOTIVATES` edges replayed from old chunk to new.
+**Resolved by Increment 1 (see `docs/DESIGN.md`'s stable-identity note, `docs/ARCHITECTURE.md`'s data model):** `:Chunk` carries `anchor_id`/`content_hash`; re-ingestion resolves against them (update in place / recognize a rename / mark orphaned) instead of deleting and recreating. `:MOTIVATES` now survives ordinary content edits. `last_distilled_at` carry-forward (flagged below as open, first raised via PR #5's commit `186489b`) is implemented as part of the in-place update path — a content change never resets it. `:CodeEntity`'s MERGE key gains `parent_name`, fixing the line-shift fragility.
 
-**Open questions — the actual research gap:**
-- **Confidence thresholds.** Below what score does a re-linked observation queue for human review via `propose_then_confirm` instead of auto-remapping? No default is proposed anywhere yet.
-- **`:CodeEntity` stable identity.** The equivalent problem for code, not just docs — today identity is `(name, path, src_start, src_end)`, which breaks on any line-shift edit. Proposed direction is `(name, path, signature_hash)`, but what exactly feeds the hash (parameter types? return type? just the signature text?) isn't decided.
-- **`last_distilled_at` carry-forward.** Added as a fix during PR review on this fork (see PR #5's commit `186489b`) but worth restating here as an open implementation detail: a successful remap must carry `Chunk.last_distilled_at` from the old node to the new one, or every reanchor makes freshly-verified chunks look unverified again.
+**Still open — the part that continues into Increment 2 (`docs/TIER1_CONTINUATION.md`):**
+- **Confidence thresholds for the fuzzy fallback.** Increment 1's matching is exact (`anchor_id` or `content_hash`). The vector-similarity fallback for chunks that match neither — the genuinely ambiguous case — still needs a threshold below which a suggestion queues for human review rather than auto-applying. No default decided yet.
+- **`signature_hash`'s exact inputs.** Scoped as a stretch/followup in Increment 1, not populated by any ingestion path yet — what exactly feeds the hash (parameter types as written vs. LSP-resolved, return type, etc.) isn't decided.
 
 ### Issue #9 — test and runtime trace ingestion (`:Test`, `:Failure`, `:EXERCISES`)
 
@@ -172,11 +168,17 @@ Named in `RATIONALE.md` §11 / `ARCHITECTURE.md`, not yet formalized as GitHub i
 
 | Fork # | Mirrors upstream | State on this fork | Divergence |
 |---|---|---|---|
-| PR #5 | #10 (`feat/memory-mcp`) | **merged** | Went through an actual review pass on this fork: found a tiering overstatement in LIFECYCLE.md's closing summary and a missing `last_distilled_at` carry-forward rule in `reanchor`. Both fixed (commit `186489b`) before merging. `docs/LIFECYCLE.md` on this fork's `main` is that corrected version — upstream #10 still carries the original text. |
-| PR #6 | n/a (fork-only) | open | This doc + `ONBOARDING.md` + README/ROADMAP/DESIGN cross-reference fixes. |
+| PR #5 | #10 (`feat/memory-mcp`) | merged | Went through an actual review pass on this fork: found a tiering overstatement in LIFECYCLE.md's closing summary and a missing `last_distilled_at` carry-forward rule in `reanchor`. Both fixed (commit `186489b`) before merging. `docs/LIFECYCLE.md` on this fork's `main` is that corrected version — upstream #10 still carries the original text. |
+| PR #6 | n/a (fork-only) | merged | `ONBOARDING.md` + this doc's first version + README/ROADMAP/DESIGN cross-reference fixes. |
+| PR #7 | n/a (fork-only) | merged | Pulled in upstream's `de6cb3b` (portable `EMBED_MODEL` default) and fixed the regression it shipped with — the default pointed at the original author's own machine path and an external repo nobody else has. |
+| PR #8 | n/a (fork-only) | merged | Expanded this doc's Productionizing and Research sections from bullet lists into full context per item. |
+| PR #9 | n/a (fork-only) | merged | The memory-layer MCP tools (§1/§2 above) — implemented, then genuinely build/test/live-verified against a real FalkorDB + llama-server + MCP client. |
+| PR #12 | n/a (fork-only) | open | Measured the doc-linker's real scaling behavior (benchmarks, `internal/doclinker/linker_bench_test.go`), corrected `RATIONALE.md`'s `O(chunks × names)` claim, filed issues #10/#11. |
 | Issue #2 | #6 | open | `:Protocol` schema — unchanged from upstream. |
-| Issue #3 | #8 | open | Anchor stability — unchanged from upstream. |
+| Issue #3 | #8 | open | Anchor stability — Increment 1 (stable identity + match-in-place ingestion) resolves the core risk; remaining open items (confidence thresholds, `signature_hash` inputs) continue in `docs/TIER1_CONTINUATION.md`. |
 | Issue #4 | #9 | open | `:Test`/`:Failure` ingestion — unchanged from upstream. |
+| Issue #10 | n/a (fork-only) | open | Cross-repo / federated query design — never had a filed issue anywhere before this fork. |
+| Issue #11 | n/a (fork-only) | open | Doc-linker recall/precision measurement — the linker's justifying claim (`RATIONALE.md` decision 6) was sampled once, years ago, against an external repo, never repeated. |
 | Issue #1 | #1 | closed | Mirrors upstream's closed state. |
 
 Upstream issues #6/#8/#9 (mirrored as fork #2/#3/#4) are unaffected by any of this — same open design questions either way, this fork just has its own copies to track against.
@@ -188,6 +190,7 @@ Upstream issues #6/#8/#9 (mirrored as fork #2/#3/#4) are unaffected by any of th
 - Config / env vars → [`ARCHITECTURE.md` — Configuration](ARCHITECTURE.md#configuration)
 - Full decision-by-decision rationale → [`RATIONALE.md`](RATIONALE.md)
 - The online-first lifecycle this pathway list is drawn from → [`LIFECYCLE.md`](LIFECYCLE.md) (merged on this fork via PR #5; upstream's copy on `feat/memory-mcp`/PR #10 still has the pre-fix text)
+- The detailed continuation plan for `reanchor`/`impact`/`surface` (Tier 1, Increment 2 — not yet built) → [`TIER1_CONTINUATION.md`](TIER1_CONTINUATION.md)
 
 ---
 

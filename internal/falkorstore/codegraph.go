@@ -50,17 +50,38 @@ func (s *Store) AddFile(ctx context.Context, path, name, ext string) (int64, err
 // AddEntity MERGEs an entity node with dual labels (entity type + Searchable)
 // and returns its FalkorDB node ID. The label parameter must be from a
 // controlled set (Function, Class, Method, Interface, Enum, Constructor).
-func (s *Store) AddEntity(ctx context.Context, label, name, doc, path string, srcStart, srcEnd int) (int64, error) {
+//
+// The MERGE key is (label, name, path, parent_name) — NOT src_start/src_end.
+// parent_name is the enclosing entity's name for nested entities (Method,
+// Constructor) and "" for top-level entities (Class, Function, Interface,
+// Enum). Two reasons this shape, not a simpler one:
+//   - Dropping src_start/src_end from the key (moving them to SET instead)
+//     is the actual fix for line-shift fragility: an unrelated edit earlier
+//     in the same file that shifts every subsequent line number no longer
+//     changes an entity's identity, it just updates its recorded position.
+//   - parent_name is required alongside that fix, not optional: without it,
+//     two different classes in one file that each define a same-named
+//     method (e.g. `class A { foo() {} }` and `class B { foo() {} }`) would
+//     MERGE onto the same node once src_start/src_end stop disambiguating
+//     them, silently collapsing two distinct methods into one.
+//
+// signatureHash may be "" — it's accepted now so callers don't need a
+// separate signature-setting call once entity-signature extraction lands
+// (see docs/TIER1_CONTINUATION.md), but nothing populates it yet.
+func (s *Store) AddEntity(ctx context.Context, label, name, doc, path, parentName string, srcStart, srcEnd int, signatureHash string) (int64, error) {
 	params := map[string]interface{}{
-		"name":      name,
-		"path":      path,
-		"src_start": srcStart,
-		"src_end":   srcEnd,
-		"doc":       doc,
+		"name":        name,
+		"path":        path,
+		"parent_name": parentName,
+		"src_start":   srcStart,
+		"src_end":     srcEnd,
+		"doc":         doc,
+		"sig_hash":    signatureHash,
 	}
 	q := fmt.Sprintf(
-		"MERGE (c:%s:Searchable {name: $name, path: $path, src_start: $src_start, src_end: $src_end}) "+
-			"SET c.doc = $doc RETURN ID(c)",
+		"MERGE (c:%s:Searchable {name: $name, path: $path, parent_name: $parent_name}) "+
+			"SET c.doc = $doc, c.src_start = $src_start, c.src_end = $src_end, c.signature_hash = $sig_hash "+
+			"RETURN ID(c)",
 		label,
 	)
 	res, err := s.graph.Query(q, params, nil)

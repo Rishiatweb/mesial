@@ -52,6 +52,8 @@ func main() {
 		err = runLink(args)
 	case "memory":
 		err = runMemory(args)
+	case "backfill-anchors":
+		err = runBackfillAnchors(args)
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 	default:
@@ -79,6 +81,13 @@ Subcommands:
   memory  <sub>             Manage the Fact/Observation memory layer
                             (init, add-obs, create-fact, link-evidence,
                              link-motivates, search-obs, search-facts)
+  backfill-anchors          One-time: compute anchor_id/content_hash on
+                            existing :Chunk nodes that predate match-in-place
+                            ingestion. Pure property SETs -- safe to re-run,
+                            zero risk to node IDs or edges. Run this once per
+                            graph before your next ingest_documents/
+                            analyze_repository call, or the first re-ingest
+                            will orphan every existing chunk once.
 
 Common flags (override defaults / env):
   --falkor-addr   FalkorDB address       (env FALKOR_ADDR,   default `+defaultFalkorAddr+`)
@@ -314,6 +323,39 @@ func runLink(args []string) error {
 		return err
 	}
 	fmt.Printf("Asserted %d DOCUMENTS edges in graph %q.\n", edges, repoName)
+	return nil
+}
+
+// --- backfill-anchors ---
+
+func runBackfillAnchors(args []string) error {
+	fs := flag.NewFlagSet("backfill-anchors", flag.ExitOnError)
+	cf := bindCommon(fs)
+	repo := fs.String("repo", "", "graph to backfill (default: --graph)")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: h9s-cli backfill-anchors [flags]\n\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	graphName := *cf.graph
+	if *repo != "" {
+		graphName = *repo
+	}
+
+	store, err := falkorstore.NewStore(*cf.falkorAddr, graphName)
+	if err != nil {
+		return fmt.Errorf("connecting to FalkorDB for graph %q: %w", graphName, err)
+	}
+	defer store.Close()
+
+	count, err := store.BackfillChunkAnchors(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Backfilled anchor_id/content_hash on %d chunk(s) in graph %q.\n", count, graphName)
 	return nil
 }
 
