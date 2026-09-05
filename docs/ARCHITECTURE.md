@@ -52,11 +52,13 @@ The Docker `ingest` container is for production / "always-on" use; it would conf
 
 | Package | Responsibility |
 |---|---|
-| `cmd/ingest` | MCP server entrypoint. Wires tools, holds the global store, and implements the request handlers including helpers `resolveRepoGraphName` and `ingestDocsToStore`. |
+| `cmd/ingest` | MCP server entrypoint. Wires the 9 tools, holds the global store, thin adapters over `internal/pipeline`. |
+| `cmd/h9s-cli` | Direct dev harness over the same `internal/pipeline` functions `cmd/ingest` uses — bypasses MCP for fast local iteration. Subcommands: `analyze`, `ingest`, `search`, `link`, `memory` (10 sub-subcommands), `backfill-anchors`. |
 | `cmd/chunker` | Standalone CLI over `internal/chunking`. Outputs JSON chunks to stdout. |
-| `internal/chunking` | Markdown chunker. Splits on `#`–`######` heading boundaries; each chunk carries breadcrumb, content, source path, and line range. |
+| `internal/pipeline` | Orchestration shared by `cmd/ingest` and `cmd/h9s-cli` — `IngestDocs`, `AnalyzeRepository`, `LinkRepo`, repo-resolution helpers, and the memory-layer wrappers (`AddObservation`, `CreateFactFromObservation`, etc.). The one place both entrypoints funnel through, so their behavior can't drift apart. |
+| `internal/chunking` | Markdown chunker. Splits on `#`–`######` heading boundaries; each chunk carries breadcrumb, content, source path, and line range. Sibling `identity.go` computes the stable-identity hashes (`anchor_id`, `content_hash`) chunks carry into `falkorstore`. |
 | `internal/embedding` | Client for llama-server's `/v1/embeddings`. Batches in groups of 32, applies Matryoshka truncation to 512-dim. |
-| `internal/falkorstore` | All FalkorDB operations. `store.go` covers chunks; `codegraph.go` covers code entities and relationships. Same `Store` type, same package. |
+| `internal/falkorstore` | All FalkorDB operations. `store.go` covers chunks (including the match-in-place upsert path); `codegraph.go` covers code entities and relationships; `memorystore.go` covers `:Fact`/`:Observation`/`:GraphMeta`. Same `Store` type, same package. |
 | `internal/analyzer` | Language-agnostic `Analyzer` interface plus a TypeScript implementation. The two-pass `Orchestrator` runs tree-sitter then LSP. |
 | `internal/lspclient` | Subprocess client for `typescript-language-server`. Handles JSON-RPC framing, `initialize`, `didOpen`, `definition`, and shutdown. |
 | `internal/doclinker` | Doc-to-code identifier-mention linker. Pure logic over the store. |
@@ -73,11 +75,18 @@ The Docker `ingest` container is for production / "always-on" use; it would conf
 
 1. **Chunk** by heading boundaries (`chunking.ChunkFile`).
 2. **MERGE** the `:File:Searchable` node for the source `.md` (`store.AddFile`).
-3. **DETACH DELETE** prior chunks for this source (`store.DeleteBySource`) — picks up renames and edits.
-4. **Partition** chunks: ≤ 6000 chars → embed; > 6000 chars → store without vector.
-5. **Embed** the normal partition in batches of 32 (`embedding.Client.Embed`); truncate to 512-dim.
-6. **Store**: `store.StoreChunks` for normal (with vectors and `:OF_FILE` edges); `store.StoreOversizedChunks` for the rest (no vector, `oversized=true`).
+3. **Compute identity** for every resulting chunk before touching the store: `chunking.ComputeAnchorID(source, breadcrumb)` and `chunking.ComputeContentHash(content)`.
+4. **Fetch existing state** for the source (`store.FetchChunkAnchors`) and **resolve each new chunk against it** (`store.UpsertChunk`) — this replaces the old delete-and-recreate step:
+   - Same `anchor_id`, same `content_hash` → **no write at all** (`ChunkUnchanged`).
+   - Same `anchor_id`, different `content_hash` → `SET` content/vector in place on the **same node** (`ChunkUpdated`) — every incoming `:MOTIVATES`/`:DOCUMENTS` edge survives untouched.
+   - No `anchor_id` match but a `content_hash` match under a different heading → carry that node forward under the new `anchor_id` (`ChunkRenamed`, section moved) — same node, same edges.
+   - No match at all → `CREATE` a new node (`ChunkCreated`).
+   - Old chunks matched by neither key are marked `orphaned_at` (`store.MarkOrphanedChunks`) — never deleted, so any `:MOTIVATES` edge pointing at them stays intact and reviewable.
+5. **Partition** chunks needing an embed (created + updated; unchanged chunks skip this entirely): ≤ 6000 chars → embed; > 6000 chars → store without vector.
+6. **Embed** the partition needing it, in batches of 32 (`embedding.Client.Embed`); truncate to 512-dim.
 7. **Link** by source: `doclinker.Linker.LinkBySource(source, strict)`.
+
+Full rationale and the exact matching/tie-break rules: `docs/DESIGN.md`'s stable-identity note and fork issue #3 (mirrors upstream #8).
 
 ### Doc-to-code linker
 
@@ -100,7 +109,9 @@ analyze_repository(path, ignore)
   → repoStore.EnsureIndex(512)                           // chunk vector index
   → ingestDocsToStore(repoStore, embedder, [path], ignore, false)
       → walks .md files, honoring `ignore` set
-      → per source: chunk, AddFile, DeleteBySource, Embed, StoreChunks, StoreOversizedChunks, LinkBySource
+      → per source: chunk, AddFile, compute identity, FetchChunkAnchors,
+        UpsertChunk (per chunk: unchanged/updated/renamed/created),
+        MarkOrphanedChunks, Embed (only what changed), LinkBySource
   → doclinker.LinkRepo(repoStore, false)                 // catches edges to entities discovered after chunks
   → return summary
 ```
@@ -139,8 +150,8 @@ The default of `strict: false` everywhere is deliberate. Most observations about
 | Label | Properties | Indices |
 |---|---|---|
 | `:File:Searchable` | `path`, `name`, `ext` | range on `(name, ext)`, fulltext on `Searchable.name` |
-| `:Class` `:Function` `:Method` `:Constructor` `:Interface` `:Enum` (each `:Searchable`) | `name`, `path`, `src_start`, `src_end`, `doc` | fulltext on `Searchable.name` |
-| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector), `last_distilled_at` (ms, optional — set when at least one `:Observation` has motivated this chunk via `:MOTIVATES`) | vector (cosine, 512-dim) on `Chunk.vector` |
+| `:Class` `:Function` `:Method` `:Constructor` `:Interface` `:Enum` (each `:Searchable`) | `name`, `path`, `parent_name` (part of the MERGE key — enclosing entity's name for `Method`/`Constructor`, `""` for top-level entities; disambiguates same-named methods on different classes in one file), `src_start`, `src_end` (position only, not identity — an unrelated earlier edit that shifts line numbers no longer changes which node this is), `doc`, `signature_hash` (optional; hash of the entity's syntactic signature text, used for rename detection — not yet populated by any ingestion path, see fork issue #3) | fulltext on `Searchable.name` |
+| `:Chunk` (not `:Searchable`) | `breadcrumb`, `content`, `source`, `line_start`, `line_end`, `vector` (or `oversized: true` when no vector), `anchor_id` (stable identity key, `sha256(source + breadcrumb-at-creation)`, assigned once and carried forward — never recomputed from later content), `content_hash` (`sha256` of whitespace-normalized content, used to detect real changes and to re-match a section moved to a new heading), `orphaned_at` (ms, optional — set when a re-ingest finds no match for this node instead of deleting it), `ambiguous_at` (ms, optional — set on a losing candidate when more than one old chunk shares a `content_hash` match during a rename), `last_distilled_at` (ms, optional — set when at least one `:Observation` has motivated this chunk via `:MOTIVATES`; preserved across in-place updates, never reset by a content change) | vector (cosine, 512-dim) on `Chunk.vector` |
 
 ### Edges
 
@@ -403,5 +414,5 @@ Defined in `cmd/ingest/main.go`. Inputs are Go structs with `jsonschema` tags; t
 - **Single-language analyzer.** Only TypeScript/TSX is parsed today. The `Analyzer` interface is built to accept more languages.
 - **Single-process LSP.** Each `analyze_repository` call spawns a fresh `typescript-language-server`. Cold start is a few seconds; could be pooled but isn't.
 - **No transactional `StoreChunks`.** Chunks are stored one at a time; partial failure leaves a partial file. Re-ingestion heals it.
-- **Stale `:File` on rename.** Renaming a `.md` leaves the old `:File` node behind (with no chunks). Cleanup is a future concern that would also affect renamed code files.
+- **Stale `:File` on rename.** Renaming a `.md` leaves the old `:File` node behind (with no chunks). Cleanup is a future concern that would also affect renamed code files. Note the contrast with `:Chunk`, which now marks `orphaned_at` instead of leaking silently — the same idea hasn't been applied to `:File` yet.
 - **Name-collision links.** A chunk that mentions `init` (or any name shared by multiple entities) emits one edge per matching entity. Documented behavior; ranking by file proximity is a future polish.

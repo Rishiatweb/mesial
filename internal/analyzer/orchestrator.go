@@ -142,7 +142,7 @@ func (o *Orchestrator) pass1(ctx context.Context, files []string, result *Result
 
 		// Create entity nodes and DEFINES edges
 		for _, entity := range fileInfo.Entities {
-			if err := o.storeEntity(ctx, entity, fileID, result); err != nil {
+			if err := o.storeEntity(ctx, entity, fileID, "", result); err != nil {
 				log.Printf("entity error in %s: %v", path, err)
 				result.Errors++
 			}
@@ -152,9 +152,13 @@ func (o *Orchestrator) pass1(ctx context.Context, files []string, result *Result
 	return fileInfos, nil
 }
 
-// storeEntity recursively stores an entity and its children, creating DEFINES edges.
-func (o *Orchestrator) storeEntity(ctx context.Context, entity *EntityInfo, parentID int64, result *Result) error {
-	entityID, err := o.store.AddEntity(ctx, entity.Label, entity.Name, entity.Doc, entity.Path, int(entity.SrcStart), int(entity.SrcEnd))
+// storeEntity recursively stores an entity and its children, creating DEFINES
+// edges. parentName is the enclosing entity's name — used by AddEntity's
+// MERGE key to disambiguate same-named nested entities (e.g. two classes in
+// one file each defining a method called the same thing) — and "" for
+// top-level entities defined directly under a :File.
+func (o *Orchestrator) storeEntity(ctx context.Context, entity *EntityInfo, parentID int64, parentName string, result *Result) error {
+	entityID, err := o.store.AddEntity(ctx, entity.Label, entity.Name, entity.Doc, entity.Path, parentName, int(entity.SrcStart), int(entity.SrcEnd), "")
 	if err != nil {
 		return err
 	}
@@ -167,9 +171,9 @@ func (o *Orchestrator) storeEntity(ctx context.Context, entity *EntityInfo, pare
 	}
 	result.Relationships++
 
-	// Recurse into children
+	// Recurse into children, passing this entity's name as their parentName
 	for _, child := range entity.Children {
-		if err := o.storeEntity(ctx, child, entityID, result); err != nil {
+		if err := o.storeEntity(ctx, child, entityID, entity.Name, result); err != nil {
 			log.Printf("child entity error: %v", err)
 			result.Errors++
 		}
