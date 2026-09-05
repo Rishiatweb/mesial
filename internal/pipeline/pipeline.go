@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mknw/h9s/internal/analyzer"
 	"github.com/mknw/h9s/internal/chunking"
@@ -31,10 +32,35 @@ const EmbeddingDim = 512
 const OversizedChunkChars = 6000
 
 // IngestResult summarizes a document ingestion run.
+//
+// ChunksStored keeps its pre-Increment-1 meaning (created + updated +
+// renamed — i.e. every chunk actually touched) so existing callers reading
+// this field don't need to change. Created/Updated/Renamed/Unchanged/
+// Orphaned are additive, giving visibility into what match-in-place
+// ingestion actually did without requiring a separate `reanchor` call for
+// the common case.
 type IngestResult struct {
 	ChunksStored    int
 	OversizedChunks int
 	EdgesAsserted   int
+	Created         int
+	Updated         int
+	Renamed         int
+	Unchanged       int
+	Orphaned        int
+}
+
+// SourceIngestReport classifies what happened to every chunk of one source
+// file during a match-first re-ingest pass.
+type SourceIngestReport struct {
+	Source          string
+	Created         []int64
+	Updated         []int64
+	Renamed         []int64
+	Unchanged       []int64
+	Orphaned        []int64
+	OversizedChunks int
+	EdgesLinked     int
 }
 
 // AnalyzeResult summarizes a full analyze_repository run (code + docs + link).
@@ -148,79 +174,147 @@ func IngestDocs(ctx context.Context, store *falkorstore.Store, embedder *embeddi
 		}
 	}
 
-	linker := doclinker.New(store)
 	var res IngestResult
 	for _, f := range files {
-		chs, err := chunking.ChunkFile(f)
+		report, err := reingestSource(ctx, store, embedder, f, strict)
 		if err != nil {
-			return res, fmt.Errorf("chunking %s: %w", f, err)
+			return res, err
 		}
-		if len(chs) == 0 {
-			continue
+		if report == nil {
+			continue // empty file, nothing to do
 		}
-		source := chs[0].Source
-
-		fileID, err := store.AddFile(ctx, source, filepath.Base(source), filepath.Ext(source))
-		if err != nil {
-			return res, fmt.Errorf("adding file node %s: %w", f, err)
-		}
-
-		if _, err := store.DeleteBySource(ctx, source); err != nil {
-			return res, fmt.Errorf("deleting old chunks for %s: %w", f, err)
-		}
-
-		var normal, oversized []chunking.Chunk
-		for _, c := range chs {
-			if len(c.Content) > OversizedChunkChars {
-				oversized = append(oversized, c)
-			} else {
-				normal = append(normal, c)
-			}
-		}
-
-		if len(normal) > 0 {
-			texts := make([]string, len(normal))
-			for i, c := range normal {
-				texts[i] = c.Breadcrumb + "\n" + c.Content
-			}
-			vectors, err := embedder.Embed(ctx, texts)
-			if err != nil {
-				return res, fmt.Errorf("embedding %s: %w", f, err)
-			}
-			fileIDs := make([]int64, len(normal))
-			for i := range fileIDs {
-				fileIDs[i] = fileID
-			}
-			n, err := store.StoreChunks(ctx, normal, vectors, fileIDs)
-			if err != nil {
-				return res, fmt.Errorf("storing chunks for %s: %w", f, err)
-			}
-			res.ChunksStored += n
-		}
-
-		if len(oversized) > 0 {
-			fileIDs := make([]int64, len(oversized))
-			for i := range fileIDs {
-				fileIDs[i] = fileID
-			}
-			n, err := store.StoreOversizedChunks(ctx, oversized, fileIDs)
-			if err != nil {
-				return res, fmt.Errorf("storing oversized chunks for %s: %w", f, err)
-			}
-			res.OversizedChunks += n
-			for _, c := range oversized {
-				log.Printf("oversized chunk skipped from embedding: %s lines %d-%d (%d chars) %q", source, c.LineStart, c.LineEnd, len(c.Content), c.Breadcrumb)
-			}
-		}
-
-		edges, err := linker.LinkBySource(ctx, source, strict)
-		if err != nil {
-			return res, fmt.Errorf("linking %s: %w", f, err)
-		}
-		res.EdgesAsserted += edges
+		res.Created += len(report.Created)
+		res.Updated += len(report.Updated)
+		res.Renamed += len(report.Renamed)
+		res.Unchanged += len(report.Unchanged)
+		res.Orphaned += len(report.Orphaned)
+		res.OversizedChunks += report.OversizedChunks
+		res.ChunksStored += len(report.Created) + len(report.Updated) + len(report.Renamed)
+		res.EdgesAsserted += report.EdgesLinked
 	}
 
 	return res, nil
+}
+
+// reingestSource chunks one markdown file, resolves every resulting chunk
+// against the source's existing identity state (match-in-place — see
+// docs/DESIGN.md's stable-identity note), embeds only what actually needs
+// it, marks anything left over as orphaned, and re-runs the linker. This is
+// the single implementation both IngestDocs and a future `reanchor` (see
+// docs/TIER1_CONTINUATION.md) call — the classification logic exists here
+// exactly once.
+//
+// Returns nil (no error) if the file chunked to nothing (e.g. an empty
+// file) — there is nothing to ingest, not a failure.
+func reingestSource(ctx context.Context, store *falkorstore.Store, embedder *embedding.Client, f string, strict bool) (*SourceIngestReport, error) {
+	chs, err := chunking.ChunkFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("chunking %s: %w", f, err)
+	}
+	if len(chs) == 0 {
+		return nil, nil
+	}
+	source := chs[0].Source
+
+	fileID, err := store.AddFile(ctx, source, filepath.Base(source), filepath.Ext(source))
+	if err != nil {
+		return nil, fmt.Errorf("adding file node %s: %w", f, err)
+	}
+
+	existing, err := store.FetchChunkAnchors(ctx, source)
+	if err != nil {
+		return nil, fmt.Errorf("fetching existing chunk state for %s: %w", f, err)
+	}
+	existingByAnchor := make(map[string]falkorstore.ChunkAnchorRow, len(existing))
+	for _, row := range existing {
+		if row.AnchorID != "" {
+			existingByAnchor[row.AnchorID] = row
+		}
+	}
+
+	// Compute identity for every new chunk up front, and decide which ones
+	// actually need embedding — skip anything whose anchor_id AND
+	// content_hash both already match existing state (predicted
+	// ChunkUnchanged) and anything oversized. This is what lets a re-ingest
+	// of an unchanged file cost zero embed calls, not just zero writes.
+	type prepared struct {
+		chunk       chunking.Chunk
+		anchorID    string
+		contentHash string
+		oversized   bool
+		needsEmbed  bool
+	}
+	items := make([]prepared, len(chs))
+	var embedTexts []string
+	var embedIndex []int
+	for i, c := range chs {
+		anchorID := chunking.ComputeAnchorID(source, c.Breadcrumb)
+		contentHash := chunking.ComputeContentHash(c.Content)
+		oversized := len(c.Content) > OversizedChunkChars
+		predictedUnchanged := false
+		if row, ok := existingByAnchor[anchorID]; ok && row.ContentHash == contentHash {
+			predictedUnchanged = true
+		}
+		needsEmbed := !oversized && !predictedUnchanged
+		items[i] = prepared{chunk: c, anchorID: anchorID, contentHash: contentHash, oversized: oversized, needsEmbed: needsEmbed}
+		if needsEmbed {
+			embedTexts = append(embedTexts, c.Breadcrumb+"\n"+c.Content)
+			embedIndex = append(embedIndex, i)
+		}
+	}
+
+	var vectors [][]float32
+	if len(embedTexts) > 0 {
+		vectors, err = embedder.Embed(ctx, embedTexts)
+		if err != nil {
+			return nil, fmt.Errorf("embedding %s: %w", f, err)
+		}
+	}
+	vectorFor := make([][]float32, len(items))
+	for i, idx := range embedIndex {
+		vectorFor[idx] = vectors[i]
+	}
+
+	report := &SourceIngestReport{Source: source}
+	claimedIDs := make(map[int64]bool, len(existing))
+	var keepIDs []int64
+	for i, it := range items {
+		id, action, err := store.UpsertChunk(ctx, source, it.chunk, vectorFor[i], it.anchorID, it.contentHash, it.oversized, fileID, existing, claimedIDs)
+		if err != nil {
+			return nil, fmt.Errorf("resolving chunk %d of %s: %w", i, f, err)
+		}
+		keepIDs = append(keepIDs, id)
+		switch action {
+		case falkorstore.ChunkCreated:
+			report.Created = append(report.Created, id)
+		case falkorstore.ChunkUpdated:
+			report.Updated = append(report.Updated, id)
+		case falkorstore.ChunkRenamed:
+			report.Renamed = append(report.Renamed, id)
+		case falkorstore.ChunkUnchanged:
+			report.Unchanged = append(report.Unchanged, id)
+		}
+		if it.oversized {
+			report.OversizedChunks++
+			if action != falkorstore.ChunkUnchanged {
+				log.Printf("oversized chunk skipped from embedding: %s lines %d-%d (%d chars) %q", source, it.chunk.LineStart, it.chunk.LineEnd, len(it.chunk.Content), it.chunk.Breadcrumb)
+			}
+		}
+	}
+
+	orphaned, err := store.MarkOrphanedChunks(ctx, source, keepIDs, time.Now().UnixMilli())
+	if err != nil {
+		return nil, fmt.Errorf("marking orphaned chunks for %s: %w", f, err)
+	}
+	report.Orphaned = orphaned
+
+	edges, err := doclinker.New(store).LinkBySource(ctx, source, strict)
+	if err != nil {
+		return nil, fmt.Errorf("linking %s: %w", f, err)
+	}
+	report.EdgesLinked = edges
+
+	return report, nil
 }
 
 // AnalyzeRepository runs the full per-repo pipeline: tree-sitter + LSP code

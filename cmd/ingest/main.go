@@ -93,14 +93,17 @@ func main() {
 			return nil, nil, err
 		}
 
-		if res.ChunksStored == 0 && res.OversizedChunks == 0 {
+		// Zero touched AND zero unchanged means no .md files matched at all —
+		// distinct from "files matched but nothing needed re-writing", which
+		// is now a real, common outcome under match-in-place ingestion.
+		if res.ChunksStored == 0 && res.OversizedChunks == 0 && res.Unchanged == 0 {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("No .md files found in the provided paths (graph %q).", repoName)}},
 			}, nil, nil
 		}
 
-		summary := fmt.Sprintf("Ingested %d chunks (%d oversized, no vector) into graph %q; %d DOCUMENTS edges asserted.",
-			res.ChunksStored, res.OversizedChunks, repoName, res.EdgesAsserted)
+		summary := fmt.Sprintf("Ingested %d chunks (%d oversized, no vector) into graph %q; %d created, %d updated in place, %d renamed, %d unchanged, %d orphaned for review; %d DOCUMENTS edges asserted.",
+			res.ChunksStored, res.OversizedChunks, repoName, res.Created, res.Updated, res.Renamed, res.Unchanged, res.Orphaned, res.EdgesAsserted)
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: summary}},
 		}, nil, nil
