@@ -320,3 +320,45 @@ func TestReingestSource_DeletedSectionIsOrphanedNotDropped(t *testing.T) {
 		t.Fatal("MOTIVATES edge to an orphaned (not deleted) chunk should still exist")
 	}
 }
+
+// TestIngestDocsSkipsUnreadableSubdirectory covers the WalkDir divergence
+// between IngestDocs and analyzer.discoverFiles: a single unreadable
+// subdirectory anywhere under a scanned root must not abort the whole scan —
+// files outside it should still be found and ingested. On platforms/setups
+// where the permission removal doesn't actually block reads (observed on
+// some Windows configurations), this degrades to a no-op assertion for the
+// "blocked" side but still exercises the real invariant on POSIX CI.
+func TestIngestDocsSkipsUnreadableSubdirectory(t *testing.T) {
+	store := newIngestTestStore(t)
+	embedder := testEmbedder(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	readable := filepath.Join(dir, "readable.md")
+	if err := os.WriteFile(readable, []byte("# Readable\n\n## Section\n\nContent.\n"), 0o644); err != nil {
+		t.Fatalf("writing readable fixture: %v", err)
+	}
+
+	blockedDir := filepath.Join(dir, "blocked")
+	if err := os.Mkdir(blockedDir, 0o755); err != nil {
+		t.Fatalf("mkdir blocked: %v", err)
+	}
+	blockedFile := filepath.Join(blockedDir, "blocked.md")
+	if err := os.WriteFile(blockedFile, []byte("# Blocked\n\n## Section\n\nContent.\n"), 0o644); err != nil {
+		t.Fatalf("writing blocked fixture: %v", err)
+	}
+	if err := os.Chmod(blockedDir, 0o000); err != nil {
+		t.Fatalf("chmod blocked: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(blockedDir, 0o755) // restore so t.TempDir() cleanup can remove it
+	})
+
+	res, err := IngestDocs(ctx, store, embedder, []string{dir}, nil, false)
+	if err != nil {
+		t.Fatalf("IngestDocs should skip the unreadable subdirectory and continue, got error: %v", err)
+	}
+	if res.Created < 1 {
+		t.Fatalf("expected readable.md to still be ingested, got %+v", res)
+	}
+}
