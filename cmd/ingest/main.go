@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mknw/h9s/internal/analyzer"
 	"github.com/mknw/h9s/internal/embedding"
 	"github.com/mknw/h9s/internal/falkorstore"
 	"github.com/mknw/h9s/internal/pipeline"
@@ -59,6 +60,7 @@ func main() {
 	type IngestInput struct {
 		Paths  []string `json:"paths"            jsonschema:"File or directory paths to ingest. Accepts .md files or directories (scanned recursively)."`
 		Repo   string   `json:"repo,omitempty"   jsonschema:"Optional repo name (FalkorDB graph). If omitted, resolved from the nearest .git ancestor of Paths[0]; all other paths must share that ancestor."`
+		Ignore []string `json:"ignore,omitempty" jsonschema:"Directory names to skip when a path is a directory (e.g. node_modules, dist, .git). Merged with sensible defaults; does not replace them."`
 		Strict bool     `json:"strict,omitempty" jsonschema:"If true, only backtick-fenced identifiers are eligible for DOCUMENTS edges (linker pass)."`
 	}
 
@@ -88,7 +90,7 @@ func main() {
 			return nil, nil, fmt.Errorf("ensuring code index: %w", err)
 		}
 
-		res, err := pipeline.IngestDocs(ctx, repoStore, embedder, input.Paths, nil, input.Strict)
+		res, err := pipeline.IngestDocs(ctx, repoStore, embedder, input.Paths, analyzer.MergeIgnore(input.Ignore), input.Strict)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -6,7 +6,7 @@
 // Subcommands:
 //
 //	h9s-cli analyze <path> [--ignore name1,...] [--repo NAME]
-//	h9s-cli ingest  <path>... [--repo NAME] [--strict]
+//	h9s-cli ingest  <path>... [--ignore name1,...] [--repo NAME] [--strict]
 //	h9s-cli search  <query>   [--k N] [--repo NAME] [--path P]
 //	h9s-cli link              [--repo NAME] [--path P] [--strict]
 //	h9s-cli memory  <sub>     manage Fact/Observation memory layer (run "memory help" for details)
@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mknw/h9s/internal/analyzer"
 	"github.com/mknw/h9s/internal/embedding"
 	"github.com/mknw/h9s/internal/falkorstore"
 	"github.com/mknw/h9s/internal/pipeline"
@@ -183,6 +184,7 @@ func runIngest(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	cf := bindCommon(fs)
 	repo := fs.String("repo", "", "override graph name (default: .git ancestor of paths[0])")
+	ignoreCSV := fs.String("ignore", "", "comma-separated dir names to skip (defaults to analyzer.MergeIgnore)")
 	strict := fs.Bool("strict", false, "only backtick-fenced identifiers create DOCUMENTS edges")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, "usage: h9s-cli ingest <path>... [flags]\n\n")
@@ -215,7 +217,7 @@ func runIngest(args []string) error {
 	}
 
 	embedder := embedding.NewClient(*cf.embeddingURL, pipeline.EmbeddingDim)
-	res, err := pipeline.IngestDocs(context.Background(), store, embedder, paths, nil, *strict)
+	res, err := pipeline.IngestDocs(context.Background(), store, embedder, paths, analyzer.MergeIgnore(splitCSV(*ignoreCSV)), *strict)
 	if err != nil {
 		return err
 	}
