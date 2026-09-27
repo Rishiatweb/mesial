@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -9,7 +10,23 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mknw/h9s/internal/falkorstore"
 )
+
+func falkorTestAddr() string {
+	if addr := os.Getenv("FALKOR_ADDR"); addr != "" {
+		return addr
+	}
+	return "localhost:6381"
+}
+
+func embeddingTestURL() string {
+	if url := os.Getenv("EMBEDDING_URL"); url != "" {
+		return url
+	}
+	return "http://localhost:8090"
+}
 
 // skipUnlessLiveInfra skips the test unless FalkorDB and the embedding
 // server are both reachable — mirrors the skip convention used by
@@ -17,10 +34,12 @@ import (
 // package and the check is a plain TCP dial rather than a store/client call.
 func skipUnlessLiveInfra(t *testing.T) {
 	t.Helper()
-	for _, addr := range []string{"localhost:6381", "localhost:8090"} {
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	addr := falkorTestAddr()
+	embedAddr := strings.TrimPrefix(strings.TrimPrefix(embeddingTestURL(), "http://"), "https://")
+	for _, a := range []string{addr, embedAddr} {
+		conn, err := net.DialTimeout("tcp", a, 2*time.Second)
 		if err != nil {
-			t.Skipf("required service unreachable at %s: %v", addr, err)
+			t.Skipf("required service unreachable at %s: %v", a, err)
 		}
 		conn.Close()
 	}
@@ -41,6 +60,14 @@ func TestIngestUnchangedReingestDoesNotReportNoFilesFound(t *testing.T) {
 	}
 
 	repo := fmt.Sprintf("test_h9scli_ingest_%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		store, err := falkorstore.NewStore(falkorTestAddr(), repo)
+		if err != nil {
+			return
+		}
+		defer store.Close()
+		_ = store.DeleteGraph(context.Background())
+	})
 
 	first := runIngestSubprocess(t, dir, repo)
 	if strings.Contains(first, "No .md files found") {

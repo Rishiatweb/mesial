@@ -154,6 +154,16 @@ func (s *Store) DeleteAllNodes(ctx context.Context) error {
 	return nil
 }
 
+// DeleteGraph removes the entire graph (GRAPH.DELETE), not just its nodes —
+// unlike DeleteAllNodes, the graph itself no longer appears afterward. Meant
+// for throwaway test graphs; not used by any production code path.
+func (s *Store) DeleteGraph(ctx context.Context) error {
+	if err := s.graph.Delete(); err != nil {
+		return fmt.Errorf("deleting graph: %w", err)
+	}
+	return nil
+}
+
 // CodeEntity is a name-indexed reference to a Searchable code entity, used by
 // the doc linker to build a name → IDs lookup table.
 type CodeEntity struct {
