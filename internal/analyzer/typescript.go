@@ -36,8 +36,10 @@ func (a *TypeScriptAnalyzer) Extensions() []string {
 func (a *TypeScriptAnalyzer) IsDependency(path string) bool {
 	parts := strings.Split(filepath.ToSlash(path), "/")
 	for _, p := range parts {
-		if p == "node_modules" {
-			return true
+		for _, ignored := range DefaultIgnore {
+			if p == ignored {
+				return true
+			}
 		}
 	}
 	return false
