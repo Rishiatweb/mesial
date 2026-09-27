@@ -223,7 +223,9 @@ The most leveraged near-term outcome is not "the graph can infer deep truths." I
 
 ## Anchor stability and re-anchoring
 
-The load-bearing risk for the memory layer. `analyze_repository` deletes-and-recreates `:Chunk` nodes on each run (the chunk IDs change), which silently drops every `:MOTIVATES` edge that pointed at the old chunks. Observations and facts then become disconnected from the documented evidence that grounded them. Verification will appear correct while the underlying ground has shifted.
+**Resolved for the core case as of Tier 1, Increment 1** (`ace7dd8`, PR #13): `IngestDocs` no longer deletes-and-recreates `:Chunk` nodes on every run. Chunks are matched in place by `anchor_id` (content edited under the same heading) or `content_hash` (moved under a renamed heading) via `UpsertChunk`; unmatched old chunks are marked `orphaned_at` rather than deleted. `:MOTIVATES` edges survive ordinary content edits and section renames — the failure mode this section originally described no longer happens for those two cases.
+
+What's still open (Increment 2, see `docs/TIER1_CONTINUATION.md`): the explicit `reanchor` primitive below — on-demand audit, confidence-scored vector-similarity fallback for ambiguous matches, and surfacing genuinely unmappable chunks for review — is not yet built. `:CodeEntity` identity (`AddEntity`'s MERGE key) was also fixed in the same increment (now keyed on `(label, name, path, parent_name)` instead of `src_start`/`src_end`), but `signature_hash`-based rename detection for code entities remains a stretch goal, not implemented.
 
 ### Stable identity properties
 
@@ -259,7 +261,7 @@ reanchor(repo, changed_sources?) → ReanchorReport {
 }
 ```
 
-Full design in **[Issue #8](https://github.com/mknw/mesial/issues/8)**. Implementation lands before fact-generation work — Invariant 2 demands it.
+Full design in **[Issue #8](https://github.com/mknw/mesial/issues/8)**, carried forward in `docs/TIER1_CONTINUATION.md`. The match-in-place resolution this primitive builds on (anchor_id/content_hash matching) already shipped in Tier 1, Increment 1 — what remains is the on-demand `reanchor` tool itself, its confidence-scored fuzzy fallback, and ambiguous-match surfacing.
 
 ---
 
@@ -677,7 +679,7 @@ Three **architectural commitments** make the invariants enforceable:
 3. **MCP elicitation as the universal commit gate** — the user is the commit gate for observations, facts, derivations, contradiction resolutions, re-anchoring decisions — keeps the system trustworthy without requiring the LLM to be infallible.
 
 Three **open design issues**, with different blast radii — not equally blocking:
-- [Issue #8](https://github.com/mknw/mesial/issues/8) — Anchor stability and re-anchoring. Broadly load-bearing: it gates `reanchor`, a **Tier-1** backbone primitive, so it must land before any Tier-1 memory work ships.
+- [Issue #8](https://github.com/mknw/mesial/issues/8) — Anchor stability and re-anchoring. The load-bearing part (stable chunk identity, match-in-place ingestion) shipped in Tier 1, Increment 1 (PR #13). What remains — the on-demand `reanchor` primitive itself — gates only its own tool, not the rest of Tier 1; see `docs/TIER1_CONTINUATION.md`.
 - [Issue #6](https://github.com/mknw/mesial/issues/6) — `:Protocol` schema (procedural memory). Gates only its own Tier-3 feature (`:Protocol` ingestion/consumption); doesn't block fact generation, `verify`, or anything in Tier 1–2.
 - [Issue #9](https://github.com/mknw/mesial/issues/9) — Test and runtime trace ingestion. Same scope as #6 — gates only `:Test`/`:Failure` ingestion, nothing upstream of it.
 
