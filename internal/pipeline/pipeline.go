@@ -134,8 +134,9 @@ func ResolvePathsToRepo(explicitRepo string, paths []string) (string, error) {
 }
 
 // IngestDocs expands the given paths to .md files (skipping `ignore`d
-// directories; per-entry walk errors, e.g. an unreadable subdirectory, are
-// skipped rather than aborting the whole scan), then per source file: MERGEs
+// directories; a walk error on an unreadable descendant is skipped rather
+// than aborting the scan, but a walk error on the requested root itself is
+// returned — there's nothing to fall back to), then per source file: MERGEs
 // a :File node, deletes existing
 // chunks for that source, chunks + embeds + stores new chunks anchored via
 // :OF_FILE, and runs the doc linker (LinkBySource). Chunks longer than
@@ -155,7 +156,10 @@ func IngestDocs(ctx context.Context, store *falkorstore.Store, embedder *embeddi
 		if info.IsDir() {
 			err := filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
 				if err != nil {
-					return nil // skip errors
+					if path == p {
+						return err // can't skip the requested root itself
+					}
+					return nil // skip unreadable descendants, keep walking
 				}
 				if d.IsDir() {
 					if ignoreSet[d.Name()] {

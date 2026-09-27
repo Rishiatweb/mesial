@@ -362,3 +362,29 @@ func TestIngestDocsSkipsUnreadableSubdirectory(t *testing.T) {
 		t.Fatalf("expected readable.md to still be ingested, got %+v", res)
 	}
 }
+
+// TestIngestDocsPreservesRootWalkError is the counterpart to
+// TestIngestDocsSkipsUnreadableSubdirectory: when the walk error is on the
+// requested root itself (not a descendant), there is nothing to fall back
+// to and skip — the root's own unreadability is exactly the failure the
+// caller asked about, so it must be returned, not silently swallowed into
+// an empty, successful-looking result. Requires no live FalkorDB/embedder:
+// this path returns before either is touched.
+func TestIngestDocsPreservesRootWalkError(t *testing.T) {
+	dir := t.TempDir()
+	blockedRoot := filepath.Join(dir, "blocked-root")
+	if err := os.Mkdir(blockedRoot, 0o755); err != nil {
+		t.Fatalf("mkdir blocked-root: %v", err)
+	}
+	if err := os.Chmod(blockedRoot, 0o000); err != nil {
+		t.Fatalf("chmod blocked-root: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(blockedRoot, 0o755) // restore so t.TempDir() cleanup can remove it
+	})
+
+	_, err := IngestDocs(context.Background(), nil, nil, []string{blockedRoot}, nil, false)
+	if err == nil {
+		t.Skip("chmod 0 did not actually block reads on this platform/setup — nothing to assert")
+	}
+}
