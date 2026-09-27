@@ -294,10 +294,16 @@ var DefaultIgnore = []string{
 
 // MergeIgnore combines user-provided ignore patterns with defaults.
 func MergeIgnore(userIgnore []string) []string {
-	if len(userIgnore) > 0 {
-		return userIgnore
+	merged := make([]string, 0, len(DefaultIgnore)+len(userIgnore))
+	seen := make(map[string]struct{}, len(DefaultIgnore)+len(userIgnore))
+	for _, name := range append(DefaultIgnore, userIgnore...) {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		merged = append(merged, name)
 	}
-	return DefaultIgnore
+	return merged
 }
 
 // RelativePath returns path relative to the repo root, or the original path.
