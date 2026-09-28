@@ -225,10 +225,15 @@ func reingestSource(ctx context.Context, store *falkorstore.Store, embedder *emb
 	if err != nil {
 		return nil, fmt.Errorf("fetching existing chunk state for %s: %w", f, err)
 	}
-	existingByAnchor := make(map[string]falkorstore.ChunkAnchorRow, len(existing))
+	// Bucketed by anchor_id (not collapsed to one row per anchor) because two
+	// existing rows can share an anchor_id — e.g. duplicate heading text
+	// predating a rename, or a not-yet-reconciled duplicate. Collapsing here
+	// would silently drop a row from this prediction pass while
+	// store.UpsertChunk's Step 1 still sees all of them.
+	existingByAnchor := make(map[string][]falkorstore.ChunkAnchorRow, len(existing))
 	for _, row := range existing {
 		if row.AnchorID != "" {
-			existingByAnchor[row.AnchorID] = row
+			existingByAnchor[row.AnchorID] = append(existingByAnchor[row.AnchorID], row)
 		}
 	}
 
@@ -237,6 +242,13 @@ func reingestSource(ctx context.Context, store *falkorstore.Store, embedder *emb
 	// content_hash both already match existing state (predicted
 	// ChunkUnchanged) and anything oversized. This is what lets a re-ingest
 	// of an unchanged file cost zero embed calls, not just zero writes.
+	//
+	// reserved simulates store.UpsertChunk's claimedIDs, one call ahead of
+	// the real thing: items are walked in the same order reingestSource will
+	// later call store.UpsertChunk in, and falkorstore.ChooseAnchorMatch is
+	// the exact same selection Step 1 uses, so a duplicate anchor_id is
+	// resolved against the same row here as it will be for real below —
+	// this prediction pass and the real claim stay in lockstep.
 	type prepared struct {
 		chunk       chunking.Chunk
 		anchorID    string
@@ -247,13 +259,19 @@ func reingestSource(ctx context.Context, store *falkorstore.Store, embedder *emb
 	items := make([]prepared, len(chs))
 	var embedTexts []string
 	var embedIndex []int
+	reserved := make(map[int64]bool, len(existing))
 	for i, c := range chs {
 		anchorID := chunking.ComputeAnchorID(source, c.Breadcrumb)
 		contentHash := chunking.ComputeContentHash(c.Content)
 		oversized := len(c.Content) > OversizedChunkChars
 		predictedUnchanged := false
-		if row, ok := existingByAnchor[anchorID]; ok && row.ContentHash == contentHash {
-			predictedUnchanged = true
+		if rows, ok := existingByAnchor[anchorID]; ok {
+			if chosen, ok := falkorstore.ChooseAnchorMatch(rows, reserved, anchorID, contentHash); ok {
+				reserved[chosen.ID] = true
+				if chosen.ContentHash == contentHash {
+					predictedUnchanged = true
+				}
+			}
 		}
 		needsEmbed := !oversized && !predictedUnchanged
 		items[i] = prepared{chunk: c, anchorID: anchorID, contentHash: contentHash, oversized: oversized, needsEmbed: needsEmbed}

@@ -235,6 +235,53 @@ func TestUpsertChunkClaimedIDsPreventsDoubleMatchInStep1(t *testing.T) {
 	}
 }
 
+// TestUpsertChunkStep1PrefersExactHashMatchAmongSameAnchorRows covers a
+// duplicate anchor_id where only one of the unclaimed candidates is truly
+// unchanged (content_hash also matches). Before ChooseAnchorMatch, Step 1
+// returned whichever unclaimed same-anchor row it reached first in
+// `existing`'s iteration order — here that's deliberately the row that is
+// NOT a content_hash match, and it also has the lower ID, so a fallback that
+// picked by list order or by lowest ID would both get this wrong. The
+// genuinely-unchanged row must still win, costing zero write.
+func TestUpsertChunkStep1PrefersExactHashMatchAmongSameAnchorRows(t *testing.T) {
+	store := newMemoryTestStore(t)
+	ctx := context.Background()
+
+	fileID, err := store.AddFile(ctx, "/repo/docs/prefer.md", "prefer.md", ".md")
+	if err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	const source = "/repo/docs/prefer.md"
+	const sharedAnchor = "shared-anchor-id"
+
+	incoming := chunking.Chunk{Breadcrumb: "Prefer > Fixed", Content: "unchanged content", Source: source}
+	incomingHash := chunking.ComputeContentHash(incoming.Content)
+
+	// Listed first, lower ID, and NOT a content_hash match.
+	existing := []ChunkAnchorRow{
+		{ID: 1, AnchorID: sharedAnchor, ContentHash: chunking.ComputeContentHash("stale content"), Breadcrumb: "Prefer > Fixed"},
+		{ID: 2, AnchorID: sharedAnchor, ContentHash: incomingHash, Breadcrumb: "Prefer > Fixed"},
+	}
+	claimedIDs := map[int64]bool{}
+
+	gotID, action, err := store.UpsertChunk(ctx, source, incoming, nil, sharedAnchor, incomingHash, false, fileID, existing, claimedIDs)
+	if err != nil {
+		t.Fatalf("UpsertChunk: %v", err)
+	}
+	if action != ChunkUnchanged {
+		t.Errorf("action = %s, want ChunkUnchanged (row 2 is the true content_hash match)", action)
+	}
+	if gotID != 2 {
+		t.Errorf("resolved ID = %d, want 2 (the exact content_hash match, not row 1 which merely came first / has the lower ID)", gotID)
+	}
+	if !claimedIDs[2] {
+		t.Error("row 2 should be claimed")
+	}
+	if claimedIDs[1] {
+		t.Error("row 1 (the non-matching row) should NOT be claimed")
+	}
+}
+
 // TestFetchChunksExcludesOrphaned is the regression test for FetchChunks
 // re-linking orphaned chunks: a chunk marked orphaned_at must not come back
 // from FetchChunks, since the linker calls it right after MarkOrphanedChunks

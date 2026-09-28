@@ -219,12 +219,18 @@ const (
 // chunks in the same ingest pass can never both resolve to the same old row —
 // e.g. two chunks that happen to compute the same anchor_id, such as
 // duplicate heading text):
-//  1. Exact anchor_id match in existing. If content_hash also matches: no
-//     write, return (existingID, ChunkUnchanged). If content_hash differs:
-//     SET content/breadcrumb/line_start/line_end/content_hash/vector in
-//     place on that same node — every incoming edge (:MOTIVATES,
-//     :DOCUMENTS) survives untouched, last_distilled_at is NOT touched.
-//     Return (existingID, ChunkUpdated).
+//  1. Exact anchor_id match in existing. Among unclaimed rows sharing that
+//     anchor_id, prefer one whose content_hash also matches (truly
+//     unchanged) over any other unclaimed same-anchor row; ties within each
+//     preference go to the lowest ID. This keeps the choice independent of
+//     `existing`'s iteration order, so a genuinely-unchanged duplicate-anchor
+//     chunk is never mistaken for an update just because a different
+//     unclaimed row of the same anchor_id happened to come first. If the
+//     chosen row's content_hash matches: no write, return (existingID,
+//     ChunkUnchanged). If it differs: SET content/breadcrumb/line_start/
+//     line_end/content_hash/vector in place on that node — every incoming
+//     edge (:MOTIVATES, :DOCUMENTS) survives untouched, last_distilled_at is
+//     NOT touched. Return (existingID, ChunkUpdated).
 //  2. No anchor_id match: look for an existing row whose content_hash
 //     matches — same content under a different heading. Exactly one
 //     candidate: carry it forward under the new anchor_id (SET
@@ -241,22 +247,19 @@ const (
 // claimedIDs accumulates IDs already resolved by earlier calls in the same
 // reingestSource pass.
 func (s *Store) UpsertChunk(ctx context.Context, source string, chunk chunking.Chunk, vector []float32, anchorID, contentHash string, oversized bool, fileID int64, existing []ChunkAnchorRow, claimedIDs map[int64]bool) (id int64, action ChunkAction, err error) {
-	// Step 1: exact anchor_id match.
-	for _, row := range existing {
-		if claimedIDs[row.ID] {
-			continue
+	// Step 1: exact anchor_id match, preferring an unclaimed row whose
+	// content_hash also matches over any other unclaimed same-anchor row —
+	// see ChooseAnchorMatch.
+	if chosen, ok := ChooseAnchorMatch(existing, claimedIDs, anchorID, contentHash); ok {
+		if chosen.ContentHash == contentHash {
+			claimedIDs[chosen.ID] = true
+			return chosen.ID, ChunkUnchanged, nil
 		}
-		if row.AnchorID != "" && row.AnchorID == anchorID {
-			if row.ContentHash == contentHash {
-				claimedIDs[row.ID] = true
-				return row.ID, ChunkUnchanged, nil
-			}
-			if err := s.updateChunkInPlace(ctx, row.ID, chunk, anchorID, contentHash, oversized, vector); err != nil {
-				return 0, "", fmt.Errorf("updating chunk %d in place: %w", row.ID, err)
-			}
-			claimedIDs[row.ID] = true
-			return row.ID, ChunkUpdated, nil
+		if err := s.updateChunkInPlace(ctx, chosen.ID, chunk, anchorID, contentHash, oversized, vector); err != nil {
+			return 0, "", fmt.Errorf("updating chunk %d in place: %w", chosen.ID, err)
 		}
+		claimedIDs[chosen.ID] = true
+		return chosen.ID, ChunkUpdated, nil
 	}
 
 	// Step 2: content_hash match under a different (or missing) anchor_id.
@@ -301,6 +304,37 @@ func (s *Store) UpsertChunk(ctx context.Context, source string, chunk chunking.C
 	}
 	claimedIDs[newID] = true
 	return newID, ChunkCreated, nil
+}
+
+// ChooseAnchorMatch picks, among rows in existing that are not in claimed and
+// whose AnchorID equals anchorID, the one Step 1 of UpsertChunk would claim:
+// prefer a row whose ContentHash also equals contentHash (truly unchanged)
+// over any other unclaimed same-anchor row; break ties in either preference
+// tier by lowest ID. Returns ok=false if no unclaimed row has that anchor_id.
+//
+// Exported so callers that need to predict Step 1's outcome ahead of the
+// real UpsertChunk call — e.g. pipeline.reingestSource deciding which chunks
+// need embedding — use the exact same selection rule instead of a
+// hand-rolled copy that could drift out of lockstep with it.
+func ChooseAnchorMatch(existing []ChunkAnchorRow, claimed map[int64]bool, anchorID, contentHash string) (ChunkAnchorRow, bool) {
+	var chosen ChunkAnchorRow
+	haveChosen := false
+	haveExact := false
+	for _, row := range existing {
+		if claimed[row.ID] || row.AnchorID == "" || row.AnchorID != anchorID {
+			continue
+		}
+		exact := row.ContentHash == contentHash
+		switch {
+		case !haveChosen:
+			chosen, haveChosen, haveExact = row, true, exact
+		case exact && !haveExact:
+			chosen, haveExact = row, true
+		case exact == haveExact && row.ID < chosen.ID:
+			chosen = row
+		}
+	}
+	return chosen, haveChosen
 }
 
 // updateChunkInPlace SETs content/breadcrumb/position/content_hash/vector on
