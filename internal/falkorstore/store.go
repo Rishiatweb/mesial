@@ -124,9 +124,9 @@ func (s *Store) BackfillChunkAnchors(ctx context.Context) (int, error) {
 		contentVal, _ := r.GetByIndex(3)
 		rows = append(rows, row{
 			id:         toInt64(idVal),
-			source:     fmt.Sprint(sourceVal),
-			breadcrumb: fmt.Sprint(breadcrumbVal),
-			body:       fmt.Sprint(contentVal),
+			source:     stringOrEmpty(sourceVal),
+			breadcrumb: stringOrEmpty(breadcrumbVal),
+			body:       stringOrEmpty(contentVal),
 		})
 	}
 
@@ -215,17 +215,19 @@ const (
 // happens against `existing`, the state FetchChunkAnchors already read for
 // this source, not against a fresh query per chunk.
 //
-// Matching order:
+// Matching order (both steps skip any row already in claimedIDs, so two new
+// chunks in the same ingest pass can never both resolve to the same old row —
+// e.g. two chunks that happen to compute the same anchor_id, such as
+// duplicate heading text):
 //  1. Exact anchor_id match in existing. If content_hash also matches: no
 //     write, return (existingID, ChunkUnchanged). If content_hash differs:
 //     SET content/breadcrumb/line_start/line_end/content_hash/vector in
 //     place on that same node — every incoming edge (:MOTIVATES,
 //     :DOCUMENTS) survives untouched, last_distilled_at is NOT touched.
 //     Return (existingID, ChunkUpdated).
-//  2. No anchor_id match: look for an existing row (not already claimed by
-//     another chunk in this same ingest pass, per claimedIDs) whose
-//     content_hash matches — same content under a different heading. Exactly
-//     one candidate: carry it forward under the new anchor_id (SET
+//  2. No anchor_id match: look for an existing row whose content_hash
+//     matches — same content under a different heading. Exactly one
+//     candidate: carry it forward under the new anchor_id (SET
 //     anchor_id/breadcrumb/line_start/line_end/vector in place, clear any
 //     stale orphaned_at). More than one candidate: pick by longest common
 //     breadcrumb-segment prefix (split on " > "), then lowest ID — the
@@ -237,11 +239,13 @@ const (
 //     :OF_FILE to fileID. Return (newID, ChunkCreated).
 //
 // claimedIDs accumulates IDs already resolved by earlier calls in the same
-// reingestSource pass, so two new chunks can't both claim the same old
-// content-hash match.
+// reingestSource pass.
 func (s *Store) UpsertChunk(ctx context.Context, source string, chunk chunking.Chunk, vector []float32, anchorID, contentHash string, oversized bool, fileID int64, existing []ChunkAnchorRow, claimedIDs map[int64]bool) (id int64, action ChunkAction, err error) {
 	// Step 1: exact anchor_id match.
 	for _, row := range existing {
+		if claimedIDs[row.ID] {
+			continue
+		}
 		if row.AnchorID != "" && row.AnchorID == anchorID {
 			if row.ContentHash == contentHash {
 				claimedIDs[row.ID] = true
@@ -530,7 +534,10 @@ type ChunkRow struct {
 }
 
 // FetchChunks returns chunks for linking. If source is empty, returns all
-// chunks in the graph; otherwise filters by c.source.
+// chunks in the graph; otherwise filters by c.source. Orphaned chunks
+// (orphaned_at set) are excluded — they're marked for review, not live
+// content, and re-linking them would keep asserting new DOCUMENTS edges from
+// stale material every re-ingest.
 func (s *Store) FetchChunks(ctx context.Context, source string) ([]ChunkRow, error) {
 	var (
 		res    *falkordb.QueryResult
@@ -538,10 +545,10 @@ func (s *Store) FetchChunks(ctx context.Context, source string) ([]ChunkRow, err
 		params = map[string]interface{}{}
 	)
 	if source == "" {
-		res, err = s.graph.Query("MATCH (c:Chunk) RETURN ID(c), c.content", nil, nil)
+		res, err = s.graph.Query("MATCH (c:Chunk) WHERE c.orphaned_at IS NULL RETURN ID(c), c.content", nil, nil)
 	} else {
 		params["source"] = source
-		res, err = s.graph.Query("MATCH (c:Chunk {source: $source}) RETURN ID(c), c.content", params, nil)
+		res, err = s.graph.Query("MATCH (c:Chunk {source: $source}) WHERE c.orphaned_at IS NULL RETURN ID(c), c.content", params, nil)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("fetching chunks: %w", err)
