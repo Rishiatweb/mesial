@@ -294,9 +294,13 @@ var DefaultIgnore = []string{
 
 // MergeIgnore combines user-provided ignore patterns with defaults.
 func MergeIgnore(userIgnore []string) []string {
-	merged := make([]string, 0, len(DefaultIgnore)+len(userIgnore))
-	seen := make(map[string]struct{}, len(DefaultIgnore)+len(userIgnore))
-	for _, name := range append(DefaultIgnore, userIgnore...) {
+	all := make([]string, 0, len(DefaultIgnore)+len(userIgnore))
+	all = append(all, DefaultIgnore...)
+	all = append(all, userIgnore...)
+
+	merged := make([]string, 0, len(all))
+	seen := make(map[string]struct{}, len(all))
+	for _, name := range all {
 		if _, ok := seen[name]; ok {
 			continue
 		}
