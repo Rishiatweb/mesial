@@ -221,7 +221,7 @@ func runIngest(args []string) error {
 	if err != nil {
 		return err
 	}
-	if res.ChunksStored == 0 && res.OversizedChunks == 0 {
+	if res.ChunksStored == 0 && res.OversizedChunks == 0 && res.Unchanged == 0 {
 		fmt.Printf("No .md files found in the provided paths (graph %q).\n", repoName)
 		return nil
 	}
