@@ -237,7 +237,7 @@ func TestUpsertChunkClaimedIDsPreventsDoubleMatchInStep1(t *testing.T) {
 
 // TestUpsertChunkStep1PrefersExactHashMatchAmongSameAnchorRows covers a
 // duplicate anchor_id where only one of the unclaimed candidates is truly
-// unchanged (content_hash also matches). Before ChooseAnchorMatch, Step 1
+// unchanged (content_hash also matches). Before ChooseChunkMatch, Step 1
 // returned whichever unclaimed same-anchor row it reached first in
 // `existing`'s iteration order — here that's deliberately the row that is
 // NOT a content_hash match, and it also has the lower ID, so a fallback that
@@ -339,5 +339,48 @@ func TestFetchChunksExcludesOrphaned(t *testing.T) {
 		if r.ID == staleID {
 			t.Fatalf("FetchChunks(\"\") returned the orphaned chunk %d", staleID)
 		}
+	}
+}
+
+// TestChooseChunkMatchStep2ClaimIsVisibleToLaterPrediction is a pure test of
+// the planner — no FalkorDB needed — for the gap ChooseAnchorMatch alone
+// left open: a Step-2 rename claim has to be visible to whatever asks about
+// the row's original anchor_id afterward, not just to whatever asks about
+// its own anchor_id. One existing row (anchor A, hash H). First incoming
+// chunk has a DIFFERENT anchor (B) but the SAME hash (H) — a heading rename,
+// content unchanged — so it claims the existing row via Step 2. A second
+// incoming chunk then arrives with anchor A and hash H, i.e. it looks like
+// an exact match for what the row used to be — but that row is now claimed,
+// so it must be planned as ChunkCreated (needing a real embedding), never
+// ChunkUnchanged. A prediction pass that only simulated Step 1 (the anchor-
+// match step) would never have reserved the row for the first chunk at all,
+// so the second chunk would wrongly plan as ChunkUnchanged here — and then
+// really resolve as ChunkCreated with a skipped (nil) vector against the
+// live store, permanently missing from KNN search.
+func TestChooseChunkMatchStep2ClaimIsVisibleToLaterPrediction(t *testing.T) {
+	existing := []ChunkAnchorRow{
+		{ID: 1, AnchorID: "anchor-A", ContentHash: "hash-H", Breadcrumb: "Doc > Old"},
+	}
+	claimed := map[int64]bool{}
+
+	plan1 := ChooseChunkMatch(existing, claimed, "anchor-B", "hash-H", "Doc > New")
+	if plan1.Action != ChunkRenamed || !plan1.Found || plan1.Row.ID != 1 {
+		t.Fatalf("first chunk (rename): got %+v, want {Action: ChunkRenamed, Found: true, Row.ID: 1}", plan1)
+	}
+	if plan1.Found {
+		claimed[plan1.Row.ID] = true
+	}
+
+	plan2 := ChooseChunkMatch(existing, claimed, "anchor-A", "hash-H", "Doc > Another")
+	if plan2.Action != ChunkCreated {
+		t.Fatalf("second chunk: action = %s, want ChunkCreated — row 1 was already claimed by the rename above", plan2.Action)
+	}
+	if plan2.Found {
+		t.Error("second chunk: Found = true, want false for ChunkCreated (no Row to report)")
+	}
+	const oversized = false
+	needsEmbed := !oversized && plan2.Action != ChunkUnchanged
+	if !needsEmbed {
+		t.Error("second chunk must be predicted to need embedding — it will really be created as a new node")
 	}
 }
